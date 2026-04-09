@@ -28,13 +28,16 @@ pub struct SidecarClient {
 }
 
 impl SidecarClient {
-    /// Connect to the sidecar at `endpoint`, waiting up to `timeout`.
-    pub async fn connect(endpoint: impl Into<String>, timeout: Duration) -> Result<Self> {
+    /// Connect to the sidecar at `endpoint`, waiting up to `connect_timeout`.
+    ///
+    /// Per-RPC timeout is deliberately NOT set — streaming chat RPCs can run
+    /// for minutes against real providers. Individual RPCs may still set
+    /// their own `tonic::Request::set_timeout` where appropriate.
+    pub async fn connect(endpoint: impl Into<String>, connect_timeout: Duration) -> Result<Self> {
         let endpoint = endpoint.into();
         let ch = tonic::transport::Endpoint::from_shared(endpoint.clone())
             .context("invalid sidecar endpoint")?
-            .connect_timeout(timeout)
-            .timeout(timeout)
+            .connect_timeout(connect_timeout)
             .connect()
             .await
             .with_context(|| format!("failed to connect to sidecar at {endpoint}"))?;
@@ -109,6 +112,48 @@ impl SidecarClient {
             .context("LlmProvider.ChatStream RPC failed")?
             .into_inner();
         Ok(stream)
+    }
+
+    // --- Harness hooks (M3) ------------------------------------------------
+
+    pub async fn on_turn_start(&self, ctx: pb::TurnContext) -> Result<pb::HookDecision> {
+        use pb::harness_client::HarnessClient;
+        let mut client = HarnessClient::new(self.channel.clone());
+        Ok(client
+            .on_turn_start(ctx)
+            .await
+            .context("Harness.OnTurnStart RPC failed")?
+            .into_inner())
+    }
+
+    pub async fn on_tool_call(&self, event: pb::ToolCallEvent) -> Result<pb::HookDecision> {
+        use pb::harness_client::HarnessClient;
+        let mut client = HarnessClient::new(self.channel.clone());
+        Ok(client
+            .on_tool_call(event)
+            .await
+            .context("Harness.OnToolCall RPC failed")?
+            .into_inner())
+    }
+
+    pub async fn on_stream_delta(&self, event: pb::DeltaEvent) -> Result<()> {
+        use pb::harness_client::HarnessClient;
+        let mut client = HarnessClient::new(self.channel.clone());
+        client
+            .on_stream_delta(event)
+            .await
+            .context("Harness.OnStreamDelta RPC failed")?;
+        Ok(())
+    }
+
+    pub async fn on_turn_end(&self, result: pb::TurnResult) -> Result<()> {
+        use pb::harness_client::HarnessClient;
+        let mut client = HarnessClient::new(self.channel.clone());
+        client
+            .on_turn_end(result)
+            .await
+            .context("Harness.OnTurnEnd RPC failed")?;
+        Ok(())
     }
 }
 

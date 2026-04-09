@@ -1,5 +1,6 @@
 .claude
 reference/
+.env
 
 # Rust
 target/

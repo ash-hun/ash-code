@@ -1,14 +1,14 @@
 """ashpy gRPC server (``grpc.aio``-based).
 
-M2 scope:
-  * ``Health.Ping`` — live (M1).
-  * ``LlmProvider`` — live: ListProviders / Capabilities / ChatStream / Switch
-    backed by :mod:`ashpy.providers`.
-  * ``SkillRegistry`` / ``CommandRegistry`` / ``Harness`` / ``ToolRegistry`` —
-    still ``UNIMPLEMENTED`` placeholders with owning-milestone messages.
+M3 adds:
+  * Real ``Harness`` servicer backed by the middleware chain.
+  * ``LlmProviderServicer.ChatStream`` detects the fake provider's
+    ``_fake_tool_call`` sentinel and emits a protobuf ``ToolCall`` delta.
+  * ``features.harness`` promoted to ``"v1"``.
 
-See :doc:`/docs/comparison_grpcio_grpcaio.md` for why we picked the async
-model.
+M2 assets kept: real LlmProvider, four built-ins via plugin contract.
+Skills / Commands / ToolRegistry remain ``UNIMPLEMENTED`` placeholders
+(M5 / M6 / M3+).
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ import grpc
 from grpc import aio as grpc_aio
 
 from . import __version__, _codegen
+from .middleware import (
+    DecisionKind,
+    ToolCallEvent as PyToolCallEvent,
+    TurnContext as PyTurnContext,
+    TurnResult as PyTurnResult,
+    build_default_chain,
+)
 from .providers import ChatMessage as PyChatMessage
 from .providers import ChatRequest as PyChatRequest
 from .providers import get_registry
@@ -34,8 +41,52 @@ API_VERSION = "v1"
 _LOG = logging.getLogger("ashpy.server")
 
 
+# Env vars that must not be passed to provider SDKs as empty strings.
+# docker-compose's ${VAR:-} pattern injects "" when the host is unset,
+# and some SDKs (anthropic, openai) read these directly from os.environ
+# rather than honoring an explicit `None`, producing
+# ``httpx.UnsupportedProtocol`` when the value is "". Scrub once at startup.
+_SCRUB_IF_EMPTY = (
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_BASE_URL",
+    "VLLM_BASE_URL",
+    "VLLM_API_KEY",
+    "OLLAMA_BASE_URL",
+    "ASH_LLM_MODEL",
+)
+
+
+def _scrub_empty_env() -> None:
+    import os as _os
+
+    for key in _SCRUB_IF_EMPTY:
+        if key in _os.environ and _os.environ[key] == "":
+            del _os.environ[key]
+
+
+_scrub_empty_env()
+
+
 def _log(msg: str) -> None:
     print(f"[ashpy] {msg}", flush=True)
+
+
+# --- global state ---------------------------------------------------------
+
+
+_MIDDLEWARE_CHAIN = None
+
+
+def get_middleware_chain():
+    global _MIDDLEWARE_CHAIN
+    if _MIDDLEWARE_CHAIN is None:
+        _MIDDLEWARE_CHAIN = build_default_chain()
+    return _MIDDLEWARE_CHAIN
+
+
+def reset_middleware_chain_for_tests(chain):
+    global _MIDDLEWARE_CHAIN
+    _MIDDLEWARE_CHAIN = chain
 
 
 # --- Servicers -------------------------------------------------------------
@@ -53,10 +104,10 @@ def _build_servicers():
                 received_unix_ms=int(time.time() * 1000),
                 features={
                     "health": "v1",
-                    "llm": "v1",        # M2 — live
+                    "llm": "v1",
                     "skills": "planned",
                     "commands": "planned",
-                    "harness": "planned",
+                    "harness": "v1",   # M3 — live
                     "tools": "planned",
                 },
             )
@@ -72,14 +123,15 @@ def _build_servicers():
                 except Exception as exc:  # noqa: BLE001
                     _LOG.warning("capabilities(%s) failed: %s", name, exc)
                     caps = None
-                info = ash_pb2.ProviderInfo(
-                    name=name,
-                    default_model=(caps.default_model if caps else cfg.model()),
-                    supports_tools=bool(caps.supports_tools) if caps else False,
-                    supports_vision=bool(caps.supports_vision) if caps else False,
-                    source=cfg.source,
+                infos.append(
+                    ash_pb2.ProviderInfo(
+                        name=name,
+                        default_model=(caps.default_model if caps else cfg.model()),
+                        supports_tools=bool(caps.supports_tools) if caps else False,
+                        supports_vision=bool(caps.supports_vision) if caps else False,
+                        source=cfg.source,
+                    )
                 )
-                infos.append(info)
             return ash_pb2.ListProvidersResponse(providers=infos)
 
         async def Capabilities(self, request, context):  # noqa: N802
@@ -96,9 +148,7 @@ def _build_servicers():
                 model=caps.default_model,
             )
 
-        async def ChatStream(  # noqa: N802
-            self, request, context
-        ) -> AsyncIterator:
+        async def ChatStream(self, request, context):  # noqa: N802
             registry = get_registry()
             name = request.provider or registry.active_name()
             try:
@@ -119,9 +169,6 @@ def _build_servicers():
 
             async for delta in provider.chat_stream(py_req):
                 if delta.error:
-                    # Represent provider errors as finish(stop_reason=error)
-                    # carried in a TurnFinish delta with the text describing
-                    # the error. This keeps the stream schema uniform.
                     yield ash_pb2.ChatDelta(text=f"[error] {delta.error}")
                     continue
                 if delta.is_finish:
@@ -163,7 +210,7 @@ def _build_servicers():
                 grpc.StatusCode.UNIMPLEMENTED,
                 f"{service} lands in a later milestone",
             )
-            if False:  # pragma: no cover — generator marker
+            if False:  # pragma: no cover
                 yield
 
         return _stub
@@ -179,15 +226,68 @@ def _build_servicers():
         Run = _unimplemented_unary("CommandRegistry.Run (M6)")
         Reload = _unimplemented_unary("CommandRegistry.Reload (M6)")
 
+    # --- Harness is LIVE as of M3 -----------------------------------------
+
+    def _decision_to_pb(dec) -> "ash_pb2.HookDecision":
+        return ash_pb2.HookDecision(
+            kind=int(dec.kind),
+            reason=dec.reason,
+            rewritten_payload=dec.rewritten_payload,
+        )
+
     class HarnessServicer(ash_pb2_grpc.HarnessServicer):
-        OnTurnStart = _unimplemented_unary("Harness.OnTurnStart (M3)")
-        OnToolCall = _unimplemented_unary("Harness.OnToolCall (M3)")
-        OnStreamDelta = _unimplemented_unary("Harness.OnStreamDelta (M3)")
-        OnTurnEnd = _unimplemented_unary("Harness.OnTurnEnd (M3)")
+        async def OnTurnStart(self, request, context):  # noqa: N802
+            chain = get_middleware_chain()
+            ctx = PyTurnContext(
+                session_id=request.session_id,
+                turn_id=request.turn_id,
+                provider=request.provider,
+                model=request.model,
+                messages=[
+                    {"role": m.role, "content": m.content, "tool_call_id": m.tool_call_id}
+                    for m in request.messages
+                ],
+                metadata=dict(request.metadata),
+            )
+            decision = await chain.on_turn_start(ctx)
+            return _decision_to_pb(decision)
+
+        async def OnToolCall(self, request, context):  # noqa: N802
+            chain = get_middleware_chain()
+            call = request.call or ash_pb2.ToolCall()
+            event = PyToolCallEvent(
+                session_id=request.session_id,
+                turn_id=request.turn_id,
+                tool_name=call.name,
+                arguments=bytes(call.arguments or b""),
+            )
+            decision = await chain.on_tool_call(event)
+            return _decision_to_pb(decision)
+
+        async def OnStreamDelta(self, request, context):  # noqa: N802
+            chain = get_middleware_chain()
+            delta = request.delta
+            payload = {"kind": delta.WhichOneof("kind") or ""}
+            await chain.on_stream_delta(payload)
+            return ash_pb2.Empty()
+
+        async def OnTurnEnd(self, request, context):  # noqa: N802
+            chain = get_middleware_chain()
+            finish = request.finish or ash_pb2.TurnFinish()
+            result = PyTurnResult(
+                session_id=request.session_id,
+                turn_id=request.turn_id,
+                stop_reason=finish.stop_reason,
+                input_tokens=finish.input_tokens,
+                output_tokens=finish.output_tokens,
+                assistant_text=request.assistant_text,
+            )
+            await chain.on_turn_end(result)
+            return ash_pb2.Empty()
 
     class ToolRegistryServicer(ash_pb2_grpc.ToolRegistryServicer):
-        List = _unimplemented_unary("ToolRegistry.List (M3+)")
-        Invoke = _unimplemented_unary("ToolRegistry.Invoke (M3+)")
+        List = _unimplemented_unary("ToolRegistry.List (M3+, host-owned)")
+        Invoke = _unimplemented_unary("ToolRegistry.Invoke (M3+, host-owned)")
 
     return {
         "pb2": ash_pb2,
@@ -223,6 +323,7 @@ async def _serve_async(bind: str) -> int:
     server, effective_bind = await build_server(bind)
     await server.start()
     _log(f"ashpy gRPC server listening on {effective_bind}")
+    _log(f"middleware chain: {get_middleware_chain().names()}")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -235,7 +336,7 @@ async def _serve_async(bind: str) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:  # pragma: no cover — Windows
+        except NotImplementedError:  # pragma: no cover
             signal.signal(sig, lambda *_: _handle_signal())
 
     await stop_event.wait()

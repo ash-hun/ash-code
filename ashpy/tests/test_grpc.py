@@ -100,7 +100,7 @@ async def test_health_ping(server_bind: str):
     assert resp.api_version == API_VERSION
     assert resp.features["health"] == "v1"
     assert resp.features["llm"] == "v1"  # promoted in M2
-    assert resp.features["harness"] == "planned"
+    assert resp.features["harness"] == "v1"  # promoted in M3
 
 
 async def test_list_providers_contains_echo(server_bind: str):
@@ -153,10 +153,10 @@ async def test_switch_provider(server_bind: str, fake_registry):
     assert fake_registry.active_name() == "echo2"
 
 
-async def test_harness_still_unimplemented(server_bind: str):
+async def test_skills_still_unimplemented(server_bind: str):
     ash_pb2, ash_pb2_grpc = _stubs()
     async with grpc_aio.insecure_channel(server_bind) as channel:
-        client = ash_pb2_grpc.HarnessStub(channel)
+        client = ash_pb2_grpc.SkillRegistryStub(channel)
         with pytest.raises(grpc.RpcError) as excinfo:
-            await client.OnTurnStart(ash_pb2.TurnContext(), timeout=2.0)
+            await client.List(ash_pb2.ListSkillsRequest(), timeout=2.0)
     assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED

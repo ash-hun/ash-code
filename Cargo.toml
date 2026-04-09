@@ -34,6 +34,15 @@ prost = "0.13"
 prost-types = "0.13"
 tokio-stream = { version = "0.1", features = ["net"] }
 async-stream = "0.3"
+async-trait = "0.1"
+futures = "0.3"
+
+# Tool runtime
+schemars = { version = "0.8", features = ["preserve_order"] }
+walkdir = "2"
+globset = "0.4"
+tempfile = "3"
+regex = "1"
 
 ash-core = { path = "crates/core" }
 ash-tools = { path = "crates/tools" }

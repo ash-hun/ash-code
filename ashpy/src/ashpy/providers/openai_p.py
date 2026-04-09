@@ -88,11 +88,18 @@ class OpenAIProvider(LlmProvider):
                 temperature=req.temperature,
                 max_tokens=max_tokens,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             input_tokens = 0
             output_tokens = 0
             finish_reason = "end_turn"
             async for chunk in stream:
+                # Usage chunks (from stream_options.include_usage) have an
+                # empty choices array; process them before the guard.
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    input_tokens = getattr(usage, "prompt_tokens", 0) or input_tokens
+                    output_tokens = getattr(usage, "completion_tokens", 0) or output_tokens
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -101,10 +108,6 @@ class OpenAIProvider(LlmProvider):
                     yield ChatDelta(text=delta.content)
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
-                usage = getattr(chunk, "usage", None)
-                if usage:
-                    input_tokens = getattr(usage, "prompt_tokens", 0) or input_tokens
-                    output_tokens = getattr(usage, "completion_tokens", 0) or output_tokens
             yield ChatDelta(
                 finish_reason=str(finish_reason),
                 input_tokens=input_tokens,

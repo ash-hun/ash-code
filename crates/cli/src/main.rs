@@ -2,7 +2,11 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use ash_ipc::pb;
+use ash_query::{QueryEngine, Session, SidecarBackend, TurnSink};
+use ash_tools::{ToolRegistry, ToolResult};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -158,49 +162,69 @@ async fn run_llm(sidecar: &str, action: LlmAction) -> anyhow::Result<()> {
             prompt,
             provider,
             model,
-            temperature,
+            temperature: _temperature,
         } => {
-            let req = pb::ChatRequest {
-                provider: provider.unwrap_or_default(),
-                model: model.unwrap_or_default(),
-                messages: vec![pb::ChatMessage {
-                    role: "user".to_string(),
-                    content: prompt,
-                    tool_call_id: String::new(),
-                }],
-                temperature,
-                tools: Vec::new(),
-            };
+            // M3: route through QueryEngine so Harness hooks + tool dispatch run.
+            let backend = Arc::new(SidecarBackend(client));
+            let tools = Arc::new(ToolRegistry::with_builtins());
+            let engine = QueryEngine::new(backend, tools);
 
-            use tokio_stream::StreamExt;
+            // If --provider not passed, leave empty so the sidecar uses its
+            // active provider (driven by ASH_LLM_PROVIDER env, which defaults
+            // to "anthropic" in docker-compose).
+            let provider_name = provider
+                .or_else(|| std::env::var("ASH_LLM_PROVIDER").ok())
+                .unwrap_or_default();
+            let model_name = model.unwrap_or_default();
+            let mut session = Session::new("cli-session", provider_name, model_name);
+            session.push_user(prompt);
 
-            let mut stream = client.chat_stream(req).await?;
-            let mut saw_finish = false;
-            while let Some(item) = stream.next().await {
-                let delta = item?;
-                match delta.kind {
-                    Some(pb::chat_delta::Kind::Text(t)) => {
-                        use std::io::Write;
-                        print!("{t}");
-                        std::io::stdout().flush().ok();
-                    }
-                    Some(pb::chat_delta::Kind::ToolCall(tc)) => {
-                        println!("\n[tool_call {}] {}", tc.name, String::from_utf8_lossy(&tc.arguments));
-                    }
-                    Some(pb::chat_delta::Kind::Finish(f)) => {
-                        saw_finish = true;
-                        println!(
-                            "\n[finish stop_reason={} in={} out={}]",
-                            f.stop_reason, f.input_tokens, f.output_tokens
-                        );
-                    }
-                    None => {}
-                }
+            let mut sink = StdoutSink::default();
+            let outcome = engine.run_turn(&mut session, &mut sink).await?;
+            if outcome.denied {
+                println!("[denied] {}", outcome.denial_reason);
             }
-            if !saw_finish {
-                println!();
-            }
+            println!(
+                "[engine turns={} stop_reason={}]",
+                outcome.turns_taken, outcome.stop_reason
+            );
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct StdoutSink;
+
+impl TurnSink for StdoutSink {
+    fn on_text(&mut self, text: &str) {
+        use std::io::Write;
+        print!("{text}");
+        std::io::stdout().flush().ok();
+    }
+
+    fn on_tool_call(&mut self, name: &str, args: &str) {
+        println!("\n[tool_call {name}] {args}");
+    }
+
+    fn on_tool_result(&mut self, name: &str, result: &ToolResult) {
+        let body = if result.ok {
+            &result.stdout
+        } else {
+            &result.stderr
+        };
+        let snippet: String = body.chars().take(200).collect();
+        println!(
+            "[tool_result {name} ok={} exit={}] {}",
+            result.ok, result.exit_code, snippet
+        );
+    }
+
+    fn on_finish(&mut self, stop_reason: &str, input: i32, output: i32) {
+        println!("\n[finish stop_reason={stop_reason} in={input} out={output}]");
+    }
+
+    fn on_error(&mut self, msg: &str) {
+        eprintln!("[error] {msg}");
+    }
 }

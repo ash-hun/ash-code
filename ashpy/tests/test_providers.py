@@ -53,7 +53,7 @@ def _empty_providers_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     return d
 
 
-async def test_registry_lists_all_four_builtins_without_env(clean_env, tmp_path):
+async def test_registry_lists_all_builtins_without_env(clean_env, tmp_path):
     reg = ProviderRegistry(providers_dir=_empty_providers_dir(tmp_path))
     assert reg.list_names() == ["anthropic", "ollama", "openai", "vllm"]
     # Default active provider falls back to anthropic even with no env set.
