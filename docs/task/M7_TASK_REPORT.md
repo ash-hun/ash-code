@@ -288,7 +288,7 @@ Interactive smoke is on the user to run and report back.
 - [x] Docker image rebuilds with Rust 1.88
 - [x] `docs/tui.md` user guide
 - [x] `docs/task/M7_TASK_REPORT.md` (this file)
-- [ ] **Manual interactive smoke by the user** — see §3.5
+- [x] **Manual interactive smoke by the user** — passed 2026-04-10
 
 ## 7. Changed files
 
@@ -310,7 +310,98 @@ Interactive smoke is on the user to run and report back.
 **Memory**
 - `project_m7_cleanup_llm_chat.md` — marked completed
 
-## 8. Next: M8 — Event bus + mid-turn cancellation
+## 8. Post-completion patch — Anthropic tool_use roundtrip enabled
+
+The first interactive smoke surfaced a blocker: the model said "I cannot
+run commands" instead of issuing a `bash` tool call, so the HITL dialog
+never fired. Root cause: the M3 "deferred" anthropic tool_use mapping
+turned out to be the prerequisite for HITL — without it, the model never
+emits a real tool call to intercept.
+
+Patched in-place rather than rolling M7 into M8, because HITL was an
+explicit M7 deliverable.
+
+### Changes
+
+- **`ashpy/src/ashpy/providers/base.py`** — added `ToolSpec` and
+  `ToolCallDelta` dataclasses, `ChatRequest.tools` field, and
+  `ChatDelta.tool_call` (with `is_tool_call` property). Provider plugins
+  can now both receive a tool advertisement and emit tool-use deltas.
+- **`ashpy/src/ashpy/providers/anthropic_p.py`**:
+  - Forwards `req.tools` into the SDK call as `tools=[…]`.
+  - Replaced `text_stream` consumption with raw `messages.stream()` event
+    iteration. We now handle `content_block_start` (detects `tool_use`
+    blocks), `content_block_delta` (`text_delta` for text + `input_json_delta`
+    for tool input), and `content_block_stop` (finalises the tool call).
+  - On the next turn, when reconstructing the message history for the
+    SDK, an assistant message containing the ash-code tool_use sentinel
+    is unpacked back into Anthropic's `tool_use` content block. The
+    matching `tool` role becomes a `user`-wrapped `tool_result` block.
+    Without this pairing, Anthropic returns a `400 invalid_request_error:
+    each tool_result block must have a corresponding tool_use block`.
+- **`ashpy/src/ashpy/server.py`** — `LlmProviderServicer.ChatStream` now:
+  - decodes the protobuf `ChatRequest.tools` (each `ToolSpec.input_schema`
+    is JSON-encoded JSON Schema bytes) into Python `ToolSpec` objects
+    before calling the provider.
+  - emits `ash_pb2.ChatDelta(tool_call=ToolCall(…))` whenever the
+    provider yields `ChatDelta.tool_call`, encoding `arguments` as
+    UTF-8 bytes.
+- **`crates/query/src/lib.rs`** — added `Session::push_assistant_tool_use(id,
+  name, arguments_json)` which writes an assistant message whose content
+  is a JSON sentinel `{"__ash_tool_use__": true, "id": ..., "name": ...,
+  "input": ...}`. The turn loop calls it before invoking the actual tool
+  so the next provider request can reconstruct the assistant→tool pairing.
+- **Test updates**:
+  - `ashpy/tests/test_providers.py::_FakeAnthropicStream` rewritten to
+    yield raw `content_block_*` events instead of the deprecated
+    `text_stream` shape, plus a small `_text_event_seq` helper.
+  - `crates/query/src/lib.rs::tool_call_roundtrip` updated to expect
+    the new role sequence `[user, assistant(tool_use), tool, assistant]`
+    and to verify the sentinel content.
+
+### Verification (post-patch)
+
+- **Rust** `cargo test --workspace`: **51 passed, 0 failed**.
+- **Python** `uv run pytest -q`: **113 passed**.
+- **End-to-end** via real Anthropic from `POST /v1/chat`:
+  ```
+  event: tool_call
+  data: {"name":"glob","arguments":"{\"pattern\":\"**/*\",\"path\":\"/workspace\"}"}
+
+  event: finish
+  data: {"stop_reason":"tool_use", "input_tokens":1171, "output_tokens":70}
+
+  event: tool_result
+  data: {"name":"glob","ok":true,"stdout":"", "stderr":"", "exit_code":0}
+
+  event: text
+  data: {"text":"The glob search returned no files. ..."}
+
+  event: text
+  data: {"text":"**0 files matched** in the `/workspace` directory."}
+
+  event: finish
+  data: {"stop_reason":"end_turn", "input_tokens":1270, "output_tokens":48}
+
+  event: outcome
+  data: {"stop_reason":"end_turn","turns_taken":2,"denied":false}
+  ```
+- **TUI manual smoke** (user-confirmed 2026-04-10): typing
+  "git status를 실행해줘" produces a real bash tool call, the HITL modal
+  appears with the command preview and three options, all key bindings
+  work, custom feedback (option 3) flows back to the model as a deny
+  reason. Everything reported as "잘되네".
+
+### Closes M3 leftover
+
+This patch finally retires the M3 "anthropic/openai tool_use mapping is
+deferred — fill in if needed" item *for Anthropic*. OpenAI's
+`tool_calls` array translation is still untouched and remains the same
+deferred backlog item.
+
+---
+
+## 9. Next: M8 — Event bus + mid-turn cancellation
 
 - Implement `crates/bus` in-process event bus so multiple consumers
   (HTTP `/v1/chat`, TUI, potential future subscribers) can observe the
