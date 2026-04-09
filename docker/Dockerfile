@@ -1,13 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- Stage 1: Rust builder ----------
-FROM rust:1.82-slim-bookworm AS rust-builder
+FROM rust:1.85-slim-bookworm AS rust-builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev ca-certificates \
+        pkg-config libssl-dev ca-certificates protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml ./
 COPY crates ./crates
+COPY proto ./proto
 RUN cargo build --release -p ash-cli
 RUN cargo test --release --workspace --no-run
 
@@ -24,7 +25,10 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/ashpy/venv \
 COPY ashpy/pyproject.toml ashpy/uv.lock* ./
 COPY ashpy/src ./src
 COPY ashpy/tests ./tests
-RUN uv sync --frozen --extra dev
+COPY proto /opt/ashpy/proto
+ENV ASH_PROTO_DIR=/opt/ashpy/proto
+RUN uv sync --frozen --extra dev \
+ && /opt/ashpy/venv/bin/python -c "from ashpy import _codegen; _codegen.generate(force=True)"
 
 # ---------- Stage 3: Runtime ----------
 # Uses the same python:3.12 base as the py-builder so that the copied
@@ -39,7 +43,8 @@ COPY --from=rust-builder /build/target/release/ash /usr/local/bin/ash
 
 # Python sidecar (copy venv from builder; same debian base so ABI matches)
 COPY --from=py-builder /opt/ashpy /opt/ashpy
-ENV PATH="/opt/ashpy/venv/bin:${PATH}"
+ENV PATH="/opt/ashpy/venv/bin:${PATH}" \
+    ASH_PROTO_DIR=/opt/ashpy/proto
 
 # Supervisor config
 COPY docker/supervisord.conf /etc/supervisor/conf.d/ash.conf

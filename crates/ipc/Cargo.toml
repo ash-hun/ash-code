@@ -6,4 +6,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-tokio.workspace = true
+tokio = { workspace = true }
+tokio-stream.workspace = true
+tonic.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+async-stream.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

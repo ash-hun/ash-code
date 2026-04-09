@@ -3,32 +3,61 @@ syntax = "proto3";
 package ash.v1;
 
 // ash-code IPC contract between the Rust host process and the Python
-// sidecar (ashpy). Finalized in M1; M0 ships the draft only.
+// sidecar (ashpy). Finalized in M1.
+//
+// Services:
+//   Health           — liveness + version handshake (smoke test)
+//   LlmProvider      — model/provider abstraction (impl lands in M2)
+//   SkillRegistry    — SKILL.md discovery + invocation (impl lands in M5)
+//   CommandRegistry  — slash command registry (impl lands in M6)
+//   Harness          — query-loop hooks / middleware control plane (impl M3)
+//   ToolRegistry     — third-party tool plugins (impl M3+)
+//
+// Conventions:
+//   * All bytes fields are UTF-8 JSON unless noted.
+//   * All string fields are UTF-8.
+//   * RPCs returning `stream` are server-streaming.
+//   * Unimplemented RPCs must return gRPC status UNIMPLEMENTED with a
+//     human-readable message naming the owning milestone.
 
+// ========================================================================
+// Health — smoke test and version handshake
+// ========================================================================
+service Health {
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {
+  string client = 1;          // e.g. "ash-cli/0.0.1"
+  int64  sent_unix_ms = 2;
+}
+message PingResponse {
+  string server = 1;          // e.g. "ashpy/0.0.1"
+  string api_version = 2;     // "v1"
+  int64  received_unix_ms = 3;
+  map<string, string> features = 4;  // e.g. {"harness":"v1","skills":"v1"}
+}
+
+// ========================================================================
+// LlmProvider — implemented in M2
+// ========================================================================
 service LlmProvider {
-  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
-  rpc ChatStream(ChatRequest) returns (stream ChatDelta);
-  rpc Switch(SwitchRequest) returns (SwitchResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+  rpc Capabilities(CapabilitiesRequest)   returns (CapabilitiesResponse);
+  rpc ChatStream(ChatRequest)             returns (stream ChatDelta);
+  rpc Switch(SwitchRequest)               returns (SwitchResponse);
 }
 
-service SkillRegistry {
-  rpc List(ListSkillsRequest) returns (ListSkillsResponse);
-  rpc Invoke(InvokeSkillRequest) returns (InvokeSkillResponse);
-  rpc Reload(ReloadRequest) returns (ReloadResponse);
-  rpc Watch(WatchRequest) returns (stream SkillEvent);
+message ListProvidersRequest {}
+message ListProvidersResponse { repeated ProviderInfo providers = 1; }
+message ProviderInfo {
+  string name = 1;
+  string default_model = 2;
+  bool   supports_tools = 3;
+  bool   supports_vision = 4;
+  string source = 5;          // "builtin" | "plugin:<path>"
 }
 
-service CommandRegistry {
-  rpc List(ListCommandsRequest) returns (ListCommandsResponse);
-  rpc Run(RunCommandRequest) returns (RunCommandResponse);
-  rpc Reload(ReloadRequest) returns (ReloadResponse);
-}
-
-// --- shared ---
-message ReloadRequest {}
-message ReloadResponse { int32 loaded = 1; }
-
-// --- LlmProvider ---
 message CapabilitiesRequest { string provider = 1; }
 message CapabilitiesResponse {
   bool supports_tools = 1;
@@ -36,58 +65,190 @@ message CapabilitiesResponse {
   int32 max_context_tokens = 3;
   string model = 4;
 }
+
 message ChatRequest {
   string provider = 1;
   string model = 2;
   repeated ChatMessage messages = 3;
   float temperature = 4;
+  repeated ToolSpec tools = 5;   // optional; empty = no tool-use this turn
 }
 message ChatMessage {
-  string role = 1;
-  string content = 2;
+  string role = 1;               // "system" | "user" | "assistant" | "tool"
+  string content = 2;            // plain text; multimodal lands later
+  string tool_call_id = 3;       // for role=tool
+}
+message ToolSpec {
+  string name = 1;
+  string description = 2;
+  bytes  input_schema = 3;       // JSON Schema (UTF-8)
 }
 message ChatDelta {
-  string text = 1;
-  bool done = 2;
+  oneof kind {
+    string text = 1;             // incremental assistant text
+    ToolCall tool_call = 2;      // model-requested tool invocation
+    TurnFinish finish = 3;       // terminal delta
+  }
 }
-message SwitchRequest {
-  string provider = 1;
-  string model = 2;
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  bytes  arguments = 3;          // JSON (UTF-8)
 }
+message TurnFinish {
+  string stop_reason = 1;        // "end_turn" | "tool_use" | "max_tokens" | ...
+  int32  input_tokens = 2;
+  int32  output_tokens = 3;
+}
+
+message SwitchRequest  { string provider = 1; string model = 2; }
 message SwitchResponse { bool ok = 1; string message = 2; }
 
-// --- SkillRegistry ---
+// ========================================================================
+// SkillRegistry — implemented in M5
+// ========================================================================
+service SkillRegistry {
+  rpc List(ListSkillsRequest)     returns (ListSkillsResponse);
+  rpc Invoke(InvokeSkillRequest)  returns (InvokeSkillResponse);
+  rpc Reload(ReloadRequest)       returns (ReloadResponse);
+  rpc Watch(WatchRequest)         returns (stream SkillEvent);
+}
+
 message Skill {
   string name = 1;
   string description = 2;
   repeated string triggers = 3;
   repeated string allowed_tools = 4;
-  string body = 5;
+  string model = 5;              // optional per-skill model override
+  string body = 6;
+  string source_path = 7;        // e.g. "/root/.ash/skills/review-diff/SKILL.md"
 }
 message ListSkillsRequest {}
 message ListSkillsResponse { repeated Skill skills = 1; }
+
 message InvokeSkillRequest {
   string name = 1;
   map<string, string> args = 2;
+  map<string, string> context = 3;  // cwd, git_branch, user, etc.
 }
-message InvokeSkillResponse { string rendered_prompt = 1; }
+message InvokeSkillResponse {
+  string rendered_prompt = 1;
+  repeated string allowed_tools = 2;
+  string model = 3;                 // may be empty (inherit session model)
+}
+
 message WatchRequest {}
 message SkillEvent {
   enum Kind { ADDED = 0; MODIFIED = 1; REMOVED = 2; }
   Kind kind = 1;
   string name = 2;
+  string source_path = 3;
 }
 
-// --- CommandRegistry ---
+// ========================================================================
+// CommandRegistry — implemented in M6
+// ========================================================================
+service CommandRegistry {
+  rpc List(ListCommandsRequest) returns (ListCommandsResponse);
+  rpc Run(RunCommandRequest)    returns (RunCommandResponse);
+  rpc Reload(ReloadRequest)     returns (ReloadResponse);
+}
+
 message Command {
   string name = 1;
   string description = 2;
   repeated string allowed_tools = 3;
+  string source_path = 4;
 }
 message ListCommandsRequest {}
 message ListCommandsResponse { repeated Command commands = 1; }
 message RunCommandRequest {
   string name = 1;
   map<string, string> args = 2;
+  map<string, string> context = 3;
 }
-message RunCommandResponse { string rendered_prompt = 1; }
+message RunCommandResponse {
+  string rendered_prompt = 1;
+  repeated string allowed_tools = 2;
+}
+
+// ========================================================================
+// Harness — query-loop hooks / middleware control plane (impl M3)
+// ========================================================================
+service Harness {
+  rpc OnTurnStart(TurnContext)  returns (HookDecision);
+  rpc OnToolCall(ToolCallEvent) returns (HookDecision);
+  rpc OnStreamDelta(DeltaEvent) returns (Empty);
+  rpc OnTurnEnd(TurnResult)     returns (Empty);
+}
+
+message Empty {}
+message TurnContext {
+  string session_id = 1;
+  string turn_id = 2;
+  string provider = 3;
+  string model = 4;
+  repeated ChatMessage messages = 5;
+  map<string, string> metadata = 6;
+}
+message ToolCallEvent {
+  string session_id = 1;
+  string turn_id = 2;
+  ToolCall call = 3;
+}
+message DeltaEvent {
+  string session_id = 1;
+  string turn_id = 2;
+  ChatDelta delta = 3;
+}
+message TurnResult {
+  string session_id = 1;
+  string turn_id = 2;
+  TurnFinish finish = 3;
+  string assistant_text = 4;
+}
+message HookDecision {
+  enum Kind { ALLOW = 0; DENY = 1; REWRITE = 2; }
+  Kind kind = 1;
+  string reason = 2;
+  bytes rewritten_payload = 3;   // JSON; semantics per hook
+}
+
+// ========================================================================
+// ToolRegistry — third-party tool plugins (impl M3+)
+// ========================================================================
+service ToolRegistry {
+  rpc List(ListToolsRequest) returns (ListToolsResponse);
+  rpc Invoke(InvokeToolRequest) returns (InvokeToolResponse);
+}
+
+message ToolInfo {
+  string name = 1;
+  string description = 2;
+  bytes  input_schema = 3;       // JSON Schema
+  string source = 4;             // "builtin" | "plugin:<path>"
+}
+message ListToolsRequest {}
+message ListToolsResponse { repeated ToolInfo tools = 1; }
+message InvokeToolRequest {
+  string name = 1;
+  bytes  arguments = 2;          // JSON
+  string session_id = 3;
+  string turn_id = 4;
+}
+message InvokeToolResponse {
+  bool   ok = 1;
+  string stdout = 2;
+  string stderr = 3;
+  int32  exit_code = 4;
+  bytes  structured = 5;         // optional structured JSON payload
+}
+
+// ========================================================================
+// Shared
+// ========================================================================
+message ReloadRequest {}
+message ReloadResponse {
+  int32 loaded = 1;
+  repeated string errors = 2;    // non-fatal errors per plugin
+}

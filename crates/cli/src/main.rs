@@ -1,7 +1,6 @@
 //! ash — unified CLI entry point.
-//!
-//! M0 scaffold: subcommand surface is declared but implementations
-//! land in later milestones (M3 for `run`, M4 for `serve`, M7 for `tui`).
+
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -23,8 +22,16 @@ enum Command {
         #[arg(long, default_value_t = ash_api::DEFAULT_PORT)]
         port: u16,
     },
-    /// Print component versions and exit.
-    Doctor,
+    /// Print component versions, optionally probing the Python sidecar.
+    Doctor {
+        /// Attempt a Health.Ping to the ashpy gRPC sidecar.
+        #[arg(long)]
+        check_sidecar: bool,
+
+        /// Sidecar endpoint override.
+        #[arg(long, default_value = ash_ipc::DEFAULT_SIDECAR_ENDPOINT)]
+        sidecar: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -39,14 +46,54 @@ fn main() -> anyhow::Result<()> {
             println!("[ash] tui: not yet implemented (scheduled for M7)");
         }
         Some(Command::Serve { host, port }) => {
-            println!("[ash] serve: not yet implemented (scheduled for M4) — would bind {host}:{port}");
+            println!(
+                "[ash] serve: not yet implemented (scheduled for M4) — would bind {host}:{port}"
+            );
         }
-        Some(Command::Doctor) | None => {
-            println!("ash {}", env!("CARGO_PKG_VERSION"));
-            println!("  ash-core  {}", ash_core::version());
-            println!("  ash-api   port={}", ash_api::DEFAULT_PORT);
-            println!("  ash-ipc   sidecar={}", ash_ipc::DEFAULT_SIDECAR_ENDPOINT);
+        Some(Command::Doctor {
+            check_sidecar,
+            sidecar,
+        }) => {
+            print_versions(&sidecar);
+            if check_sidecar {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let outcome = rt.block_on(probe_sidecar(&sidecar));
+                match outcome {
+                    Ok(msg) => println!("  sidecar: OK — {msg}"),
+                    Err(err) => {
+                        println!("  sidecar: FAIL — {err:#}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+        None => {
+            print_versions(ash_ipc::DEFAULT_SIDECAR_ENDPOINT);
         }
     }
     Ok(())
+}
+
+fn print_versions(sidecar: &str) {
+    println!("ash {}", env!("CARGO_PKG_VERSION"));
+    println!("  ash-core  {}", ash_core::version());
+    println!("  ash-api   port={}", ash_api::DEFAULT_PORT);
+    println!("  ash-ipc   sidecar={sidecar}");
+}
+
+async fn probe_sidecar(endpoint: &str) -> anyhow::Result<String> {
+    let client = ash_ipc::SidecarClient::connect(endpoint.to_string(), Duration::from_secs(3))
+        .await?;
+    let started = std::time::Instant::now();
+    let resp = client.ping().await?;
+    let elapsed = started.elapsed();
+    Ok(format!(
+        "{} api={} features={} ({:.1} ms)",
+        resp.server,
+        resp.api_version,
+        resp.features.len(),
+        elapsed.as_secs_f64() * 1000.0
+    ))
 }

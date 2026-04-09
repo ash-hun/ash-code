@@ -27,6 +27,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "=4.5.20", features = ["derive", "env"] }
 
+# gRPC
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+async-stream = "0.3"
+
 ash-core = { path = "crates/core" }
 ash-tools = { path = "crates/tools" }
 ash-query = { path = "crates/query" }
