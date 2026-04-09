@@ -16,6 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
 from ..providers import get_registry
+from . import routes_skills
 from .query_client import DEFAULT_QUERY_HOST_ENDPOINT, QueryHostClient
 from .schemas import (
     ChatRequest,
@@ -52,6 +53,7 @@ def create_app(
         allow_headers=["*"],
     )
     app.state.query_client = QueryHostClient(query_host_endpoint)
+    app.include_router(routes_skills.router)
 
     # --- Health -----------------------------------------------------------
 
@@ -65,7 +67,7 @@ def create_app(
                 "http": "v1",
                 "llm": "v1",
                 "harness": "v1",
-                "skills": "planned",
+                "skills": "v1",
                 "commands": "planned",
             },
         )

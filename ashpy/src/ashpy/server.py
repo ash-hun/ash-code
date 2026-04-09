@@ -34,6 +34,9 @@ from .middleware import (
 from .providers import ChatMessage as PyChatMessage
 from .providers import ChatRequest as PyChatRequest
 from .providers import get_registry
+from .skills import get_registry as get_skill_registry
+from .skills.schema import SkillEventKind
+from .skills.watcher import SkillWatcher
 
 DEFAULT_BIND = "127.0.0.1:50051"
 API_VERSION = "v1"
@@ -105,9 +108,9 @@ def _build_servicers():
                 features={
                     "health": "v1",
                     "llm": "v1",
-                    "skills": "planned",
+                    "skills": "v1",    # M5 — live
                     "commands": "planned",
-                    "harness": "v1",   # M3 — live
+                    "harness": "v1",
                     "tools": "planned",
                 },
             )
@@ -216,10 +219,71 @@ def _build_servicers():
         return _stub
 
     class SkillRegistryServicer(ash_pb2_grpc.SkillRegistryServicer):
-        List = _unimplemented_unary("SkillRegistry.List (M5)")
-        Invoke = _unimplemented_unary("SkillRegistry.Invoke (M5)")
-        Reload = _unimplemented_unary("SkillRegistry.Reload (M5)")
-        Watch = _unimplemented_stream("SkillRegistry.Watch (M5)")
+        async def List(self, request, context):  # noqa: N802
+            reg = get_skill_registry()
+            skills = reg.list_skills()
+            return ash_pb2.ListSkillsResponse(
+                skills=[
+                    ash_pb2.Skill(
+                        name=s.name,
+                        description=s.description,
+                        triggers=s.triggers,
+                        allowed_tools=s.allowed_tools,
+                        model=s.model,
+                        body=s.body,
+                        source_path=s.source_path,
+                    )
+                    for s in skills
+                ]
+            )
+
+        async def Invoke(self, request, context):  # noqa: N802
+            reg = get_skill_registry()
+            try:
+                result = reg.invoke(
+                    request.name,
+                    args=dict(request.args),
+                    context=dict(request.context),
+                )
+            except KeyError:
+                await context.abort(
+                    grpc.StatusCode.NOT_FOUND,
+                    f"unknown skill: {request.name}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"render failed: {exc}",
+                )
+            return ash_pb2.InvokeSkillResponse(
+                rendered_prompt=result.rendered_prompt,
+                allowed_tools=result.allowed_tools,
+                model=result.model,
+            )
+
+        async def Reload(self, request, context):  # noqa: N802
+            reg = get_skill_registry()
+            loaded, errors = reg.reload()
+            return ash_pb2.ReloadResponse(loaded=loaded, errors=errors)
+
+        async def Watch(self, request, context):  # noqa: N802
+            reg = get_skill_registry()
+            queue = reg.subscribe()
+            try:
+                while True:
+                    event = await queue.get()
+                    kind_map = {
+                        SkillEventKind.ADDED: ash_pb2.SkillEvent.ADDED,
+                        SkillEventKind.MODIFIED: ash_pb2.SkillEvent.MODIFIED,
+                        SkillEventKind.REMOVED: ash_pb2.SkillEvent.REMOVED,
+                    }
+                    yield ash_pb2.SkillEvent(
+                        kind=kind_map[event.kind],
+                        name=event.name,
+                        source_path=event.source_path,
+                    )
+            finally:
+                reg.unsubscribe(queue)
 
     class CommandRegistryServicer(ash_pb2_grpc.CommandRegistryServicer):
         List = _unimplemented_unary("CommandRegistry.List (M6)")
@@ -326,6 +390,18 @@ async def _serve_async(bind: str, http_host: str, http_port: int) -> int:
     _log(f"ashpy gRPC server listening on {effective_bind}")
     _log(f"middleware chain: {get_middleware_chain().names()}")
 
+    # --- Skill watcher (M5) ---
+    skill_reg = get_skill_registry()
+    skill_watcher = SkillWatcher(skill_reg, loop=asyncio.get_running_loop())
+    try:
+        skill_watcher.start()
+        _log(
+            f"skill registry loaded {len(skill_reg.list_skills())} skill(s) from {skill_reg.directory}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skill watcher failed to start: {exc}")
+        skill_watcher = None
+
     # --- FastAPI (uvicorn) in the same event loop (M4, b1 layout) ---
     from .api import create_app  # lazy — only needed for `serve`
 
@@ -363,6 +439,8 @@ async def _serve_async(bind: str, http_host: str, http_port: int) -> int:
 
     await stop_event.wait()
 
+    if skill_watcher is not None:
+        skill_watcher.stop()
     if uvicorn_server is not None:
         uvicorn_server.should_exit = True
     await server.stop(grace=2.0)

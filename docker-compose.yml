@@ -20,6 +20,12 @@ services:
       - ASH_LLM_PROVIDER=${ASH_LLM_PROVIDER:-anthropic}
       - ASH_LLM_MODEL=${ASH_LLM_MODEL:-}
 
+      # --- skills (M5) ---
+      # Polling fallback for bind-mounted host paths on macOS/Windows Docker
+      # Desktop, where inotify events don't cross the VM boundary. Set to 1
+      # to force polling; leave blank for native inotify on Linux hosts.
+      - ASH_SKILLS_POLLING=${ASH_SKILLS_POLLING:-}
+
       # --- Anthropic ---
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
