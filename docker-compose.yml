@@ -1,0 +1,40 @@
+services:
+  ash-code:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ash-code:dev
+    container_name: ash-code
+    tty: true
+    stdin_open: true
+    ports:
+      - "8080:8080"            # Rust axum + Swagger UI
+    volumes:
+      - ./workspace:/workspace
+      - ./.ash:/root/.ash
+      - ./skills:/root/.ash/skills          # custom SKILL.md (hot-reloaded)
+      - ./commands:/root/.ash/commands      # custom slash commands
+      - ./providers:/root/.ash/providers    # custom provider configs
+    environment:
+      # --- harness selection ---
+      - ASH_LLM_PROVIDER=${ASH_LLM_PROVIDER:-anthropic}
+      - ASH_LLM_MODEL=${ASH_LLM_MODEL:-}
+
+      # --- Anthropic ---
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+
+      # --- OpenAI-compatible ---
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+
+      # --- External vLLM server (OpenAI-compatible) ---
+      # The ash-code container does NOT host vLLM. Point this at your own
+      # vLLM deployment, e.g. VLLM_BASE_URL=https://vllm.internal/v1
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-}
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+
+      # --- External Ollama server ---
+      # The ash-code container does NOT host Ollama. Point this at your own
+      # Ollama deployment, e.g. OLLAMA_BASE_URL=https://ollama.internal
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}

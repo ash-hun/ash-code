@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package ash.v1;
+
+// ash-code IPC contract between the Rust host process and the Python
+// sidecar (ashpy). Finalized in M1; M0 ships the draft only.
+
+service LlmProvider {
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc ChatStream(ChatRequest) returns (stream ChatDelta);
+  rpc Switch(SwitchRequest) returns (SwitchResponse);
+}
+
+service SkillRegistry {
+  rpc List(ListSkillsRequest) returns (ListSkillsResponse);
+  rpc Invoke(InvokeSkillRequest) returns (InvokeSkillResponse);
+  rpc Reload(ReloadRequest) returns (ReloadResponse);
+  rpc Watch(WatchRequest) returns (stream SkillEvent);
+}
+
+service CommandRegistry {
+  rpc List(ListCommandsRequest) returns (ListCommandsResponse);
+  rpc Run(RunCommandRequest) returns (RunCommandResponse);
+  rpc Reload(ReloadRequest) returns (ReloadResponse);
+}
+
+// --- shared ---
+message ReloadRequest {}
+message ReloadResponse { int32 loaded = 1; }
+
+// --- LlmProvider ---
+message CapabilitiesRequest { string provider = 1; }
+message CapabilitiesResponse {
+  bool supports_tools = 1;
+  bool supports_vision = 2;
+  int32 max_context_tokens = 3;
+  string model = 4;
+}
+message ChatRequest {
+  string provider = 1;
+  string model = 2;
+  repeated ChatMessage messages = 3;
+  float temperature = 4;
+}
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+message ChatDelta {
+  string text = 1;
+  bool done = 2;
+}
+message SwitchRequest {
+  string provider = 1;
+  string model = 2;
+}
+message SwitchResponse { bool ok = 1; string message = 2; }
+
+// --- SkillRegistry ---
+message Skill {
+  string name = 1;
+  string description = 2;
+  repeated string triggers = 3;
+  repeated string allowed_tools = 4;
+  string body = 5;
+}
+message ListSkillsRequest {}
+message ListSkillsResponse { repeated Skill skills = 1; }
+message InvokeSkillRequest {
+  string name = 1;
+  map<string, string> args = 2;
+}
+message InvokeSkillResponse { string rendered_prompt = 1; }
+message WatchRequest {}
+message SkillEvent {
+  enum Kind { ADDED = 0; MODIFIED = 1; REMOVED = 2; }
+  Kind kind = 1;
+  string name = 2;
+}
+
+// --- CommandRegistry ---
+message Command {
+  string name = 1;
+  string description = 2;
+  repeated string allowed_tools = 3;
+}
+message ListCommandsRequest {}
+message ListCommandsResponse { repeated Command commands = 1; }
+message RunCommandRequest {
+  string name = 1;
+  map<string, string> args = 2;
+}
+message RunCommandResponse { string rendered_prompt = 1; }

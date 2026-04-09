@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/tools",
+    "crates/query",
+    "crates/tui",
+    "crates/api",
+    "crates/ipc",
+    "crates/bus",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["ash-code contributors"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "=4.5.20", features = ["derive", "env"] }
+
+ash-core = { path = "crates/core" }
+ash-tools = { path = "crates/tools" }
+ash-query = { path = "crates/query" }
+ash-tui = { path = "crates/tui" }
+ash-api = { path = "crates/api" }
+ash-ipc = { path = "crates/ipc" }
+ash-bus = { path = "crates/bus" }
