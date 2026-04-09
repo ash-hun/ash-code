@@ -1,0 +1,13 @@
+name = "test"
+description = "Run project tests and analyze the output"
+allowed_tools = ["bash", "file_read"]
+prompt = """
+Run the project's test suite and analyze the result.
+
+1. Detect the stack by inspecting the repo root (look for Cargo.toml,
+   pyproject.toml, package.json, etc.) with the bash tool.
+2. Run the appropriate test command. Target: `{{ args.target | default("all tests") }}`.
+3. If any tests fail, read the failing files with file_read and explain
+   the likely cause.
+4. End with a one-line summary: `N passed, M failed`.
+"""

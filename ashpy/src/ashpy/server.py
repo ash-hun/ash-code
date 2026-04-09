@@ -37,6 +37,8 @@ from .providers import get_registry
 from .skills import get_registry as get_skill_registry
 from .skills.schema import SkillEventKind
 from .skills.watcher import SkillWatcher
+from .commands import get_registry as get_command_registry
+from .commands.watcher import CommandWatcher
 
 DEFAULT_BIND = "127.0.0.1:50051"
 API_VERSION = "v1"
@@ -109,7 +111,7 @@ def _build_servicers():
                     "health": "v1",
                     "llm": "v1",
                     "skills": "v1",    # M5 — live
-                    "commands": "planned",
+                    "commands": "v1",  # M6 — live
                     "harness": "v1",
                     "tools": "planned",
                 },
@@ -286,9 +288,51 @@ def _build_servicers():
                 reg.unsubscribe(queue)
 
     class CommandRegistryServicer(ash_pb2_grpc.CommandRegistryServicer):
-        List = _unimplemented_unary("CommandRegistry.List (M6)")
-        Run = _unimplemented_unary("CommandRegistry.Run (M6)")
-        Reload = _unimplemented_unary("CommandRegistry.Reload (M6)")
+        async def List(self, request, context):  # noqa: N802
+            reg = get_command_registry()
+            commands = reg.list_commands()
+            return ash_pb2.ListCommandsResponse(
+                commands=[
+                    ash_pb2.Command(
+                        name=c.name,
+                        description=c.description,
+                        allowed_tools=c.allowed_tools,
+                        source_path=c.source_path,
+                    )
+                    for c in commands
+                ]
+            )
+
+        async def Run(self, request, context):  # noqa: N802
+            # gRPC `Run` is a dry-run / render-only entry point.
+            # Actually executing a turn lives on the HTTP side at
+            # POST /v1/commands/{name}/run (SSE).
+            reg = get_command_registry()
+            try:
+                result = reg.render(
+                    request.name,
+                    args=dict(request.args),
+                    context=dict(request.context),
+                )
+            except KeyError:
+                await context.abort(
+                    grpc.StatusCode.NOT_FOUND,
+                    f"unknown command: {request.name}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"render failed: {exc}",
+                )
+            return ash_pb2.RunCommandResponse(
+                rendered_prompt=result.rendered_prompt,
+                allowed_tools=result.allowed_tools,
+            )
+
+        async def Reload(self, request, context):  # noqa: N802
+            reg = get_command_registry()
+            loaded, errors = reg.reload()
+            return ash_pb2.ReloadResponse(loaded=loaded, errors=errors)
 
     # --- Harness is LIVE as of M3 -----------------------------------------
 
@@ -402,6 +446,18 @@ async def _serve_async(bind: str, http_host: str, http_port: int) -> int:
         _log(f"skill watcher failed to start: {exc}")
         skill_watcher = None
 
+    # --- Command watcher (M6) ---
+    command_reg = get_command_registry()
+    command_watcher = CommandWatcher(command_reg, loop=asyncio.get_running_loop())
+    try:
+        command_watcher.start()
+        _log(
+            f"command registry loaded {len(command_reg.list_commands())} command(s) from {command_reg.directory}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"command watcher failed to start: {exc}")
+        command_watcher = None
+
     # --- FastAPI (uvicorn) in the same event loop (M4, b1 layout) ---
     from .api import create_app  # lazy — only needed for `serve`
 
@@ -441,6 +497,8 @@ async def _serve_async(bind: str, http_host: str, http_port: int) -> int:
 
     if skill_watcher is not None:
         skill_watcher.stop()
+    if command_watcher is not None:
+        command_watcher.stop()
     if uvicorn_server is not None:
         uvicorn_server.should_exit = True
     await server.stop(grace=2.0)

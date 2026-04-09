@@ -153,10 +153,10 @@ async def test_switch_provider(server_bind: str, fake_registry):
     assert fake_registry.active_name() == "echo2"
 
 
-async def test_commands_still_unimplemented(server_bind: str):
+async def test_tool_registry_still_unimplemented(server_bind: str):
     ash_pb2, ash_pb2_grpc = _stubs()
     async with grpc_aio.insecure_channel(server_bind) as channel:
-        client = ash_pb2_grpc.CommandRegistryStub(channel)
+        client = ash_pb2_grpc.ToolRegistryStub(channel)
         with pytest.raises(grpc.RpcError) as excinfo:
-            await client.List(ash_pb2.ListCommandsRequest(), timeout=2.0)
+            await client.List(ash_pb2.ListToolsRequest(), timeout=2.0)
     assert excinfo.value.code() == grpc.StatusCode.UNIMPLEMENTED
