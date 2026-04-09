@@ -245,6 +245,76 @@ message InvokeToolResponse {
 }
 
 // ========================================================================
+// QueryHost — Rust-hosted turn engine, called FROM the Python FastAPI
+// layer (reverse gRPC direction). Added in M4.
+// ========================================================================
+//
+// Runs on 127.0.0.1:50052 inside the ash-code container. Only the
+// `ashpy` FastAPI process is expected to call it; it is never exposed
+// outside the container.
+service QueryHost {
+  rpc RunTurn(RunTurnRequest) returns (stream TurnDelta);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+}
+
+message RunTurnRequest {
+  string session_id = 1;
+  string prompt = 2;
+  string provider = 3;       // optional — empty = sidecar default
+  string model = 4;          // optional
+  bool reset_session = 5;    // drop existing messages before running
+}
+
+message TurnDelta {
+  oneof kind {
+    string text = 1;
+    ToolCall tool_call = 2;
+    ToolResultDelta tool_result = 3;
+    TurnFinish finish = 4;
+    string error = 5;
+    TurnOutcome outcome = 6;   // sent once at stream end
+  }
+}
+
+message ToolResultDelta {
+  string name = 1;
+  bool ok = 2;
+  string stdout = 3;
+  string stderr = 4;
+  int32 exit_code = 5;
+}
+
+message TurnOutcome {
+  string stop_reason = 1;
+  int32 turns_taken = 2;
+  bool denied = 3;
+  string denial_reason = 4;
+}
+
+message SessionSummary {
+  string id = 1;
+  string provider = 2;
+  string model = 3;
+  int32 message_count = 4;
+}
+
+message ListSessionsRequest {}
+message ListSessionsResponse {
+  repeated SessionSummary sessions = 1;
+}
+
+message GetSessionRequest { string id = 1; }
+message GetSessionResponse {
+  SessionSummary summary = 1;
+  repeated ChatMessage messages = 2;
+}
+
+message DeleteSessionRequest { string id = 1; }
+message DeleteSessionResponse { bool ok = 1; }
+
+// ========================================================================
 // Shared
 // ========================================================================
 message ReloadRequest {}

@@ -319,11 +319,33 @@ async def build_server(bind: str = DEFAULT_BIND) -> tuple[grpc_aio.Server, str]:
     return server, bind
 
 
-async def _serve_async(bind: str) -> int:
+async def _serve_async(bind: str, http_host: str, http_port: int) -> int:
+    # --- gRPC server (customization services: LlmProvider, Harness, …) ---
     server, effective_bind = await build_server(bind)
     await server.start()
     _log(f"ashpy gRPC server listening on {effective_bind}")
     _log(f"middleware chain: {get_middleware_chain().names()}")
+
+    # --- FastAPI (uvicorn) in the same event loop (M4, b1 layout) ---
+    from .api import create_app  # lazy — only needed for `serve`
+
+    http_task = None
+    uvicorn_server = None
+    if http_port > 0:
+        import uvicorn
+
+        app = create_app()
+        config = uvicorn.Config(
+            app,
+            host=http_host,
+            port=http_port,
+            log_level="info",
+            loop="asyncio",
+            lifespan="on",
+        )
+        uvicorn_server = uvicorn.Server(config)
+        http_task = asyncio.create_task(uvicorn_server.serve())
+        _log(f"ashpy FastAPI listening on http://{http_host}:{http_port}")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -340,13 +362,25 @@ async def _serve_async(bind: str) -> int:
             signal.signal(sig, lambda *_: _handle_signal())
 
     await stop_event.wait()
+
+    if uvicorn_server is not None:
+        uvicorn_server.should_exit = True
     await server.stop(grace=2.0)
+    if http_task is not None:
+        try:
+            await asyncio.wait_for(http_task, timeout=3.0)
+        except asyncio.TimeoutError:
+            http_task.cancel()
     _log("sidecar stopped")
     return 0
 
 
-def serve(bind: str = DEFAULT_BIND) -> int:
-    return asyncio.run(_serve_async(bind))
+def serve(
+    bind: str = DEFAULT_BIND,
+    http_host: str = "0.0.0.0",
+    http_port: int = 8080,
+) -> int:
+    return asyncio.run(_serve_async(bind, http_host, http_port))
 
 
 if __name__ == "__main__":

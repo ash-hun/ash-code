@@ -21,12 +21,22 @@ enum Command {
     /// Launch the interactive TUI (M7).
     Tui,
 
-    /// Run the HTTP API + Swagger UI (M4).
+    /// Run the Rust `QueryHost` gRPC server that the Python FastAPI layer
+    /// calls from its `/v1/chat` handler. See docs/comparison_api_structure.md.
     Serve {
-        #[arg(long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        #[arg(long, default_value_t = ash_api::DEFAULT_PORT)]
+        #[arg(long, default_value_t = ash_api::DEFAULT_QUERY_HOST_PORT)]
         port: u16,
+        /// Python sidecar gRPC endpoint (LlmProvider, Harness, …).
+        #[arg(long, default_value = ash_ipc::DEFAULT_SIDECAR_ENDPOINT)]
+        sidecar: String,
+        /// Default provider name when requests leave it empty.
+        #[arg(long, env = "ASH_LLM_PROVIDER", default_value = "anthropic")]
+        provider: String,
+        /// Default model name when requests leave it empty.
+        #[arg(long, env = "ASH_LLM_MODEL", default_value = "")]
+        model: String,
     },
 
     /// Print component versions, optionally probing the Python sidecar.
@@ -77,10 +87,17 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Tui) => {
             println!("[ash] tui: not yet implemented (scheduled for M7)");
         }
-        Some(Command::Serve { host, port }) => {
-            println!(
-                "[ash] serve: not yet implemented (scheduled for M4) — would bind {host}:{port}"
-            );
+        Some(Command::Serve {
+            host,
+            port,
+            sidecar,
+            provider,
+            model,
+        }) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(ash_api::serve(host, port, sidecar, provider, model))?;
         }
         Some(Command::Doctor {
             check_sidecar,

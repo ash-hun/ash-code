@@ -1079,3 +1079,228 @@ class ToolRegistry(object):
             timeout,
             metadata,
             _registered_method=True)
+
+
+class QueryHostStub(object):
+    """========================================================================
+    QueryHost — Rust-hosted turn engine, called FROM the Python FastAPI
+    layer (reverse gRPC direction). Added in M4.
+    ========================================================================
+
+    Runs on 127.0.0.1:50052 inside the ash-code container. Only the
+    `ashpy` FastAPI process is expected to call it; it is never exposed
+    outside the container.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.RunTurn = channel.unary_stream(
+                '/ash.v1.QueryHost/RunTurn',
+                request_serializer=ash__pb2.RunTurnRequest.SerializeToString,
+                response_deserializer=ash__pb2.TurnDelta.FromString,
+                _registered_method=True)
+        self.ListSessions = channel.unary_unary(
+                '/ash.v1.QueryHost/ListSessions',
+                request_serializer=ash__pb2.ListSessionsRequest.SerializeToString,
+                response_deserializer=ash__pb2.ListSessionsResponse.FromString,
+                _registered_method=True)
+        self.GetSession = channel.unary_unary(
+                '/ash.v1.QueryHost/GetSession',
+                request_serializer=ash__pb2.GetSessionRequest.SerializeToString,
+                response_deserializer=ash__pb2.GetSessionResponse.FromString,
+                _registered_method=True)
+        self.DeleteSession = channel.unary_unary(
+                '/ash.v1.QueryHost/DeleteSession',
+                request_serializer=ash__pb2.DeleteSessionRequest.SerializeToString,
+                response_deserializer=ash__pb2.DeleteSessionResponse.FromString,
+                _registered_method=True)
+
+
+class QueryHostServicer(object):
+    """========================================================================
+    QueryHost — Rust-hosted turn engine, called FROM the Python FastAPI
+    layer (reverse gRPC direction). Added in M4.
+    ========================================================================
+
+    Runs on 127.0.0.1:50052 inside the ash-code container. Only the
+    `ashpy` FastAPI process is expected to call it; it is never exposed
+    outside the container.
+    """
+
+    def RunTurn(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListSessions(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSession(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteSession(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_QueryHostServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'RunTurn': grpc.unary_stream_rpc_method_handler(
+                    servicer.RunTurn,
+                    request_deserializer=ash__pb2.RunTurnRequest.FromString,
+                    response_serializer=ash__pb2.TurnDelta.SerializeToString,
+            ),
+            'ListSessions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSessions,
+                    request_deserializer=ash__pb2.ListSessionsRequest.FromString,
+                    response_serializer=ash__pb2.ListSessionsResponse.SerializeToString,
+            ),
+            'GetSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSession,
+                    request_deserializer=ash__pb2.GetSessionRequest.FromString,
+                    response_serializer=ash__pb2.GetSessionResponse.SerializeToString,
+            ),
+            'DeleteSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteSession,
+                    request_deserializer=ash__pb2.DeleteSessionRequest.FromString,
+                    response_serializer=ash__pb2.DeleteSessionResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'ash.v1.QueryHost', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('ash.v1.QueryHost', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class QueryHost(object):
+    """========================================================================
+    QueryHost — Rust-hosted turn engine, called FROM the Python FastAPI
+    layer (reverse gRPC direction). Added in M4.
+    ========================================================================
+
+    Runs on 127.0.0.1:50052 inside the ash-code container. Only the
+    `ashpy` FastAPI process is expected to call it; it is never exposed
+    outside the container.
+    """
+
+    @staticmethod
+    def RunTurn(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/ash.v1.QueryHost/RunTurn',
+            ash__pb2.RunTurnRequest.SerializeToString,
+            ash__pb2.TurnDelta.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListSessions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ash.v1.QueryHost/ListSessions',
+            ash__pb2.ListSessionsRequest.SerializeToString,
+            ash__pb2.ListSessionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ash.v1.QueryHost/GetSession',
+            ash__pb2.GetSessionRequest.SerializeToString,
+            ash__pb2.GetSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ash.v1.QueryHost/DeleteSession',
+            ash__pb2.DeleteSessionRequest.SerializeToString,
+            ash__pb2.DeleteSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
