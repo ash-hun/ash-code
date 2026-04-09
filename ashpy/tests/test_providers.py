@@ -164,11 +164,38 @@ async def test_provider_capabilities_defaults(provider_cls, expected_default):
 # --- streaming happy path (mocked) -----------------------------------------
 
 
+class _StubEvent:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def _text_event_seq(chunks):
+    """Build a fake anthropic event stream that emits text deltas."""
+    events = [
+        _StubEvent(
+            type="content_block_start",
+            index=0,
+            content_block=_StubEvent(type="text", text=""),
+        )
+    ]
+    for c in chunks:
+        events.append(
+            _StubEvent(
+                type="content_block_delta",
+                index=0,
+                delta=_StubEvent(type="text_delta", text=c),
+            )
+        )
+    events.append(_StubEvent(type="content_block_stop", index=0))
+    return events
+
+
 class _FakeAnthropicStream:
     """Mimics the async context manager shape of anthropic.messages.stream."""
 
     def __init__(self, chunks):
-        self._chunks = chunks
+        self._events = _text_event_seq(chunks)
 
     async def __aenter__(self):
         return self
@@ -176,11 +203,10 @@ class _FakeAnthropicStream:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    @property
-    def text_stream(self):
+    def __aiter__(self):
         async def _gen():
-            for c in self._chunks:
-                yield c
+            for ev in self._events:
+                yield ev
 
         return _gen()
 

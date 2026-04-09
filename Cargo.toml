@@ -45,6 +45,11 @@ tempfile = "3"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 
+# TUI (M7)
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
+
 ash-core = { path = "crates/core" }
 ash-tools = { path = "crates/tools" }
 ash-query = { path = "crates/query" }

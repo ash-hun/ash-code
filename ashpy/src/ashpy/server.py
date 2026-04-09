@@ -33,6 +33,7 @@ from .middleware import (
 )
 from .providers import ChatMessage as PyChatMessage
 from .providers import ChatRequest as PyChatRequest
+from .providers import ToolSpec as PyToolSpec
 from .providers import get_registry
 from .skills import get_registry as get_skill_registry
 from .skills.schema import SkillEventKind
@@ -162,6 +163,23 @@ def _build_servicers():
                 await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown provider: {name}")
                 return
 
+            # Decode tools advertised by the Rust turn loop. Each
+            # ToolSpec.input_schema is a JSON-encoded JSON Schema document.
+            tool_specs: list[PyToolSpec] = []
+            import json as _json
+            for t in request.tools:
+                try:
+                    schema = _json.loads(bytes(t.input_schema)) if t.input_schema else {}
+                except _json.JSONDecodeError:
+                    schema = {}
+                tool_specs.append(
+                    PyToolSpec(
+                        name=t.name,
+                        description=t.description,
+                        input_schema=schema,
+                    )
+                )
+
             py_req = PyChatRequest(
                 provider=name,
                 model=request.model,
@@ -170,11 +188,21 @@ def _build_servicers():
                     for m in request.messages
                 ],
                 temperature=request.temperature or 0.0,
+                tools=tool_specs,
             )
 
             async for delta in provider.chat_stream(py_req):
                 if delta.error:
                     yield ash_pb2.ChatDelta(text=f"[error] {delta.error}")
+                    continue
+                if delta.is_tool_call and delta.tool_call is not None:
+                    yield ash_pb2.ChatDelta(
+                        tool_call=ash_pb2.ToolCall(
+                            id=delta.tool_call.id,
+                            name=delta.tool_call.name,
+                            arguments=delta.tool_call.arguments.encode("utf-8"),
+                        )
+                    )
                     continue
                 if delta.is_finish:
                     yield ash_pb2.ChatDelta(

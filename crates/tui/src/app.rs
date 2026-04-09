@@ -1,0 +1,414 @@
+//! Pure state and logic for the TUI. No I/O, no ratatui, no tokio —
+//! everything here is deterministic and unit-testable.
+
+use ash_tools::ToolResult;
+use tokio::sync::oneshot;
+
+use crate::backend::{ApprovalDecision, PendingApproval};
+
+/// One visible row in the chat scroll buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatLine {
+    User(String),
+    Assistant(String),
+    ToolCall { name: String, args: String },
+    ToolResult { name: String, ok: bool, body: String },
+    Finish { stop_reason: String, input_tokens: i32, output_tokens: i32 },
+    Error(String),
+    Denial { tool: String, reason: String },
+}
+
+/// Top-level mode of the UI. Only one is active at a time.
+#[derive(Debug)]
+pub enum Mode {
+    Normal,
+    Approval(ApprovalState),
+}
+
+/// State captured while a bash approval dialog is open.
+#[derive(Debug)]
+pub struct ApprovalState {
+    pub request: PendingApproval,
+    pub selected: usize, // 0 = Yes, 1 = No, 2 = Custom
+    pub custom_input: String,
+    pub editing_custom: bool,
+    pub responder: Option<oneshot::Sender<ApprovalDecision>>,
+}
+
+impl ApprovalState {
+    pub fn new(request: PendingApproval, responder: oneshot::Sender<ApprovalDecision>) -> Self {
+        Self {
+            request,
+            selected: 0,
+            custom_input: String::new(),
+            editing_custom: false,
+            responder: Some(responder),
+        }
+    }
+
+    pub fn resolve(&mut self, decision: ApprovalDecision) {
+        if let Some(tx) = self.responder.take() {
+            let _ = tx.send(decision);
+        }
+    }
+}
+
+/// Full mutable state of the TUI.
+pub struct AppState {
+    pub chat: Vec<ChatLine>,
+    pub input: String,
+    pub scroll: usize,
+    pub mode: Mode,
+    pub running_turn: bool,
+    pub should_quit: bool,
+
+    // Read-only meta for the header/footer
+    pub provider: String,
+    pub model: String,
+    pub session_id: String,
+    pub turns_taken: usize,
+}
+
+impl AppState {
+    pub fn new(provider: String, model: String, session_id: String) -> Self {
+        Self {
+            chat: Vec::new(),
+            input: String::new(),
+            scroll: 0,
+            mode: Mode::Normal,
+            running_turn: false,
+            should_quit: false,
+            provider,
+            model,
+            session_id,
+            turns_taken: 0,
+        }
+    }
+
+    // --- input editing -----------------------------------------------------
+
+    pub fn push_char(&mut self, c: char) {
+        if let Mode::Approval(approval) = &mut self.mode {
+            if approval.editing_custom {
+                approval.custom_input.push(c);
+            }
+            return;
+        }
+        if self.running_turn {
+            return;
+        }
+        self.input.push(c);
+    }
+
+    pub fn backspace(&mut self) {
+        if let Mode::Approval(approval) = &mut self.mode {
+            if approval.editing_custom {
+                approval.custom_input.pop();
+            }
+            return;
+        }
+        if self.running_turn {
+            return;
+        }
+        self.input.pop();
+    }
+
+    /// Returns the prompt to submit, and clears the input buffer.
+    pub fn take_prompt(&mut self) -> Option<String> {
+        if self.running_turn {
+            return None;
+        }
+        let trimmed = self.input.trim().to_string();
+        self.input.clear();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    // --- chat log mutation -------------------------------------------------
+
+    pub fn push_user(&mut self, text: String) {
+        self.chat.push(ChatLine::User(text));
+    }
+
+    /// Append streaming text from the assistant.
+    /// Coalesces into the most recent Assistant line when possible so that
+    /// streaming deltas do not produce one line per token.
+    pub fn push_text_delta(&mut self, text: &str) {
+        if let Some(ChatLine::Assistant(existing)) = self.chat.last_mut() {
+            existing.push_str(text);
+        } else {
+            self.chat.push(ChatLine::Assistant(text.to_string()));
+        }
+    }
+
+    pub fn push_tool_call(&mut self, name: &str, args: &str) {
+        self.chat.push(ChatLine::ToolCall {
+            name: name.to_string(),
+            args: args.to_string(),
+        });
+    }
+
+    pub fn push_tool_result(&mut self, name: &str, result: &ToolResult) {
+        let body = if result.ok {
+            &result.stdout
+        } else {
+            &result.stderr
+        };
+        let snippet: String = body.chars().take(400).collect();
+        self.chat.push(ChatLine::ToolResult {
+            name: name.to_string(),
+            ok: result.ok,
+            body: snippet,
+        });
+    }
+
+    pub fn push_finish(&mut self, stop_reason: &str, input_tokens: i32, output_tokens: i32) {
+        self.chat.push(ChatLine::Finish {
+            stop_reason: stop_reason.to_string(),
+            input_tokens,
+            output_tokens,
+        });
+    }
+
+    pub fn push_error(&mut self, message: String) {
+        self.chat.push(ChatLine::Error(message));
+    }
+
+    pub fn push_denial(&mut self, tool: String, reason: String) {
+        self.chat.push(ChatLine::Denial { tool, reason });
+    }
+
+    // --- approval mode ----------------------------------------------------
+
+    pub fn enter_approval(
+        &mut self,
+        request: PendingApproval,
+        responder: oneshot::Sender<ApprovalDecision>,
+    ) {
+        self.mode = Mode::Approval(ApprovalState::new(request, responder));
+    }
+
+    pub fn approval_select_next(&mut self) {
+        if let Mode::Approval(a) = &mut self.mode {
+            if !a.editing_custom {
+                a.selected = (a.selected + 1) % 3;
+            }
+        }
+    }
+
+    pub fn approval_select_prev(&mut self) {
+        if let Mode::Approval(a) = &mut self.mode {
+            if !a.editing_custom {
+                a.selected = (a.selected + 2) % 3;
+            }
+        }
+    }
+
+    pub fn approval_confirm(&mut self) {
+        let decision = if let Mode::Approval(a) = &mut self.mode {
+            match a.selected {
+                0 => Some(ApprovalDecision::Allow),
+                1 => Some(ApprovalDecision::Deny {
+                    reason: "user denied".to_string(),
+                }),
+                2 => {
+                    if !a.editing_custom {
+                        a.editing_custom = true;
+                        return;
+                    }
+                    let reason = a.custom_input.trim().to_string();
+                    if reason.is_empty() {
+                        None
+                    } else {
+                        Some(ApprovalDecision::Deny { reason })
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(d) = decision {
+            if let Mode::Approval(a) = &mut self.mode {
+                a.resolve(d);
+            }
+            self.mode = Mode::Normal;
+        }
+    }
+
+    pub fn approval_cancel(&mut self) {
+        if let Mode::Approval(a) = &mut self.mode {
+            a.resolve(ApprovalDecision::Deny {
+                reason: "user cancelled".to_string(),
+            });
+        }
+        self.mode = Mode::Normal;
+    }
+
+    // --- scroll -----------------------------------------------------------
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+    }
+
+    pub fn scroll_bottom(&mut self) {
+        self.scroll = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    fn fresh() -> AppState {
+        AppState::new(
+            "anthropic".to_string(),
+            "claude-opus-4-5".to_string(),
+            "sess-test".to_string(),
+        )
+    }
+
+    #[test]
+    fn input_editing_basic() {
+        let mut s = fresh();
+        s.push_char('h');
+        s.push_char('i');
+        assert_eq!(s.input, "hi");
+        s.backspace();
+        assert_eq!(s.input, "h");
+    }
+
+    #[test]
+    fn take_prompt_returns_trimmed_and_clears() {
+        let mut s = fresh();
+        s.input = "  hello  ".to_string();
+        assert_eq!(s.take_prompt().as_deref(), Some("hello"));
+        assert_eq!(s.input, "");
+    }
+
+    #[test]
+    fn take_prompt_empty_returns_none() {
+        let mut s = fresh();
+        s.input = "   ".to_string();
+        assert!(s.take_prompt().is_none());
+    }
+
+    #[test]
+    fn take_prompt_blocked_while_running() {
+        let mut s = fresh();
+        s.input = "hi".to_string();
+        s.running_turn = true;
+        assert!(s.take_prompt().is_none());
+    }
+
+    #[test]
+    fn text_delta_coalesces_into_last_assistant_line() {
+        let mut s = fresh();
+        s.push_text_delta("hel");
+        s.push_text_delta("lo");
+        assert_eq!(s.chat.len(), 1);
+        if let ChatLine::Assistant(text) = &s.chat[0] {
+            assert_eq!(text, "hello");
+        } else {
+            panic!("expected assistant line");
+        }
+    }
+
+    #[test]
+    fn text_delta_after_tool_call_starts_new_line() {
+        let mut s = fresh();
+        s.push_text_delta("hel");
+        s.push_tool_call("bash", "{}");
+        s.push_text_delta("lo");
+        assert_eq!(s.chat.len(), 3);
+    }
+
+    #[test]
+    fn approval_cycle_yes() {
+        let mut s = fresh();
+        let (tx, mut rx) = oneshot::channel::<ApprovalDecision>();
+        s.enter_approval(
+            PendingApproval {
+                tool_name: "bash".to_string(),
+                arguments: "{\"command\":\"ls\"}".to_string(),
+            },
+            tx,
+        );
+        assert!(matches!(s.mode, Mode::Approval(_)));
+        s.approval_confirm(); // selected=0 → Allow
+        assert!(matches!(s.mode, Mode::Normal));
+        let decision = rx.try_recv().unwrap();
+        assert!(matches!(decision, ApprovalDecision::Allow));
+    }
+
+    #[test]
+    fn approval_cycle_no() {
+        let mut s = fresh();
+        let (tx, mut rx) = oneshot::channel::<ApprovalDecision>();
+        s.enter_approval(
+            PendingApproval {
+                tool_name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            },
+            tx,
+        );
+        s.approval_select_next(); // → 1
+        s.approval_confirm();
+        let decision = rx.try_recv().unwrap();
+        match decision {
+            ApprovalDecision::Deny { reason } => assert!(reason.contains("denied")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn approval_cycle_custom_feedback() {
+        let mut s = fresh();
+        let (tx, mut rx) = oneshot::channel::<ApprovalDecision>();
+        s.enter_approval(
+            PendingApproval {
+                tool_name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            },
+            tx,
+        );
+        s.approval_select_next(); // → 1
+        s.approval_select_next(); // → 2
+        s.approval_confirm(); // enters custom edit mode
+        for c in "please ls -la instead".chars() {
+            s.push_char(c);
+        }
+        s.approval_confirm(); // submit custom feedback
+        let decision = rx.try_recv().unwrap();
+        match decision {
+            ApprovalDecision::Deny { reason } => assert_eq!(reason, "please ls -la instead"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn approval_cancel_emits_deny() {
+        let mut s = fresh();
+        let (tx, mut rx) = oneshot::channel::<ApprovalDecision>();
+        s.enter_approval(
+            PendingApproval {
+                tool_name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            },
+            tx,
+        );
+        s.approval_cancel();
+        assert!(matches!(s.mode, Mode::Normal));
+        let decision = rx.try_recv().unwrap();
+        assert!(matches!(decision, ApprovalDecision::Deny { .. }));
+    }
+}

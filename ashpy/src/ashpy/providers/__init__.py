@@ -16,6 +16,8 @@ from .base import (
     ProviderConfig,
     ProviderError,
     ProviderNotConfigured,
+    ToolCallDelta,
+    ToolSpec,
 )
 from .loader import ProviderRegistry, get_registry
 
@@ -31,5 +33,7 @@ __all__ = [
     "ProviderError",
     "ProviderNotConfigured",
     "ProviderRegistry",
+    "ToolCallDelta",
+    "ToolSpec",
     "get_registry",
 ]

@@ -81,6 +81,33 @@ impl Session {
             tool_call_id: tool_call_id.into(),
         });
     }
+
+    /// Records the assistant's outgoing tool-use request so providers
+    /// that require explicit pairing (Anthropic) can reconstruct it.
+    /// Stored as an opaque JSON sentinel inside the `content` field —
+    /// providers detect the marker and translate appropriately.
+    pub fn push_assistant_tool_use(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments_json: &str,
+    ) {
+        let id_s = id.into();
+        let name_s = name.into();
+        let input: serde_json::Value =
+            serde_json::from_str(arguments_json).unwrap_or(serde_json::Value::Null);
+        let payload = serde_json::json!({
+            "__ash_tool_use__": true,
+            "id": id_s,
+            "name": name_s,
+            "input": input,
+        });
+        self.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: payload.to_string(),
+            tool_call_id: id_s,
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +341,12 @@ impl QueryEngine {
 
                 let args_value: serde_json::Value = serde_json::from_slice(&tc.arguments)
                     .unwrap_or(serde_json::Value::Null);
+                // Persist the assistant-side tool_use record so the next
+                // turn's request to the provider can reconstruct the
+                // pairing. Anthropic strictly requires this.
+                let args_str = String::from_utf8_lossy(&tc.arguments).into_owned();
+                session.push_assistant_tool_use(&tc.id, &tc.name, &args_str);
+
                 let result = match self.tools.invoke(&tc.name, args_value).await {
                     Ok(r) => r,
                     Err(err) => ToolResult::err_text(format!("tool {} failed: {err}", tc.name)),
@@ -510,9 +543,12 @@ mod tests {
 
         let written = tokio::fs::read_to_string(&target).await.unwrap();
         assert_eq!(written, "ash-code was here");
-        // Session should contain user + assistant(tool_use) placeholder + tool result + assistant text
+        // Session contains: user → assistant(tool_use sentinel) → tool result → assistant text
         let roles: Vec<_> = session.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, vec!["user", "tool", "assistant"]);
+        assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+        // First assistant message should carry the tool_use sentinel.
+        assert!(session.messages[1].content.contains("__ash_tool_use__"));
+        assert_eq!(session.messages[1].content.contains("file_write"), true);
     }
 
     #[tokio::test]

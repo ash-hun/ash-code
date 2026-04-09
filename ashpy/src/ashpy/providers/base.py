@@ -20,7 +20,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, ClassVar
+from typing import Any, AsyncIterator, ClassVar, Optional
 
 
 # --- Errors -----------------------------------------------------------------
@@ -99,22 +99,42 @@ class ChatMessage:
 
 
 @dataclass
+class ToolSpec:
+    """Tool advertised to the LLM. Mirrors proto ``ToolSpec``."""
+
+    name: str
+    description: str
+    input_schema: dict  # parsed JSON Schema
+
+
+@dataclass
 class ChatRequest:
     provider: str
     model: str
     messages: list[ChatMessage]
     temperature: float = 0.2
+    tools: list[ToolSpec] = field(default_factory=list)
+
+
+@dataclass
+class ToolCallDelta:
+    """Tool-use request emitted by the model mid-stream."""
+
+    id: str
+    name: str
+    arguments: str  # UTF-8 JSON
 
 
 @dataclass
 class ChatDelta:
     """Unified streaming delta.
 
-    Exactly one of ``text``, ``finish``, or ``error`` is set on a given
-    delta. ``tool_call`` handling is deferred to M3 per the M2 plan.
+    Exactly one of ``text``, ``tool_call``, ``finish``, or ``error`` is
+    set on a given delta. M7 enables ``tool_call`` so HITL works.
     """
 
     text: str = ""
+    tool_call: Optional["ToolCallDelta"] = None
     finish_reason: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
@@ -127,6 +147,10 @@ class ChatDelta:
     @property
     def is_error(self) -> bool:
         return bool(self.error)
+
+    @property
+    def is_tool_call(self) -> bool:
+        return self.tool_call is not None
 
 
 # --- Contract ---------------------------------------------------------------
