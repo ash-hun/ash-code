@@ -16,5 +16,6 @@ ash-ipc.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

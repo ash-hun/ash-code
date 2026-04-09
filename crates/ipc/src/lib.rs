@@ -64,6 +64,52 @@ impl SidecarClient {
             .into_inner();
         Ok(resp)
     }
+
+    /// `LlmProvider.ListProviders` — enumerate every provider the sidecar knows about.
+    pub async fn list_providers(&self) -> Result<Vec<pb::ProviderInfo>> {
+        use pb::llm_provider_client::LlmProviderClient;
+        let mut client = LlmProviderClient::new(self.channel.clone());
+        let resp = client
+            .list_providers(pb::ListProvidersRequest {})
+            .await
+            .context("LlmProvider.ListProviders RPC failed")?
+            .into_inner();
+        Ok(resp.providers)
+    }
+
+    /// `LlmProvider.Switch` — change the active provider / model.
+    pub async fn switch_provider(
+        &self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<pb::SwitchResponse> {
+        use pb::llm_provider_client::LlmProviderClient;
+        let mut client = LlmProviderClient::new(self.channel.clone());
+        let resp = client
+            .switch(pb::SwitchRequest {
+                provider: provider.into(),
+                model: model.into(),
+            })
+            .await
+            .context("LlmProvider.Switch RPC failed")?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// `LlmProvider.ChatStream` — open a server-streaming chat session.
+    pub async fn chat_stream(
+        &self,
+        request: pb::ChatRequest,
+    ) -> Result<tonic::Streaming<pb::ChatDelta>> {
+        use pb::llm_provider_client::LlmProviderClient;
+        let mut client = LlmProviderClient::new(self.channel.clone());
+        let stream = client
+            .chat_stream(request)
+            .await
+            .context("LlmProvider.ChatStream RPC failed")?
+            .into_inner();
+        Ok(stream)
+    }
 }
 
 /// Tiny dependency-free milliseconds-since-epoch helper so that `ash-ipc`

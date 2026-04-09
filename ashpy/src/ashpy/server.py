@@ -1,55 +1,59 @@
-"""ashpy gRPC server.
+"""ashpy gRPC server (``grpc.aio``-based).
 
-M1 scope:
-  * Implements ``Health.Ping`` for real — used by ``ash doctor --check-sidecar``.
-  * Registers every other service (``LlmProvider`` / ``SkillRegistry`` /
-    ``CommandRegistry`` / ``Harness`` / ``ToolRegistry``) as a placeholder
-    that returns ``UNIMPLEMENTED`` until its owning milestone fills it in.
-  * Handles SIGTERM/SIGINT gracefully so ``supervisord`` can restart cleanly.
+M2 scope:
+  * ``Health.Ping`` — live (M1).
+  * ``LlmProvider`` — live: ListProviders / Capabilities / ChatStream / Switch
+    backed by :mod:`ashpy.providers`.
+  * ``SkillRegistry`` / ``CommandRegistry`` / ``Harness`` / ``ToolRegistry`` —
+    still ``UNIMPLEMENTED`` placeholders with owning-milestone messages.
 
-The generated gRPC stubs are produced on-the-fly by :mod:`ashpy._codegen`
-on first import, so there are no checked-in generated files to drift.
+See :doc:`/docs/comparison_grpcio_grpcaio.md` for why we picked the async
+model.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import signal
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from typing import AsyncIterator
 
 import grpc
+from grpc import aio as grpc_aio
 
 from . import __version__, _codegen
+from .providers import ChatMessage as PyChatMessage
+from .providers import ChatRequest as PyChatRequest
+from .providers import get_registry
 
 DEFAULT_BIND = "127.0.0.1:50051"
 API_VERSION = "v1"
+
+_LOG = logging.getLogger("ashpy.server")
 
 
 def _log(msg: str) -> None:
     print(f"[ashpy] {msg}", flush=True)
 
 
-# --- Service implementations ----------------------------------------------
+# --- Servicers -------------------------------------------------------------
 
 
 def _build_servicers():
-    """Import generated stubs lazily so that ``import ashpy`` stays cheap."""
     _codegen.ensure_generated()
     from ashpy._generated import ash_pb2, ash_pb2_grpc  # type: ignore
 
     class HealthServicer(ash_pb2_grpc.HealthServicer):
-        def Ping(self, request, context):  # noqa: N802 — grpc naming
+        async def Ping(self, request, context):  # noqa: N802
             return ash_pb2.PingResponse(
                 server=f"ashpy/{__version__}",
                 api_version=API_VERSION,
                 received_unix_ms=int(time.time() * 1000),
                 features={
                     "health": "v1",
-                    # Advertise the next milestones as 'planned' so clients can
-                    # distinguish "not yet" from "unknown".
-                    "llm": "planned",
+                    "llm": "v1",        # M2 — live
                     "skills": "planned",
                     "commands": "planned",
                     "harness": "planned",
@@ -57,50 +61,133 @@ def _build_servicers():
                 },
             )
 
-    def _unimplemented(service: str):
-        def _stub(self, request, context):  # noqa: ARG001
-            context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-            context.set_details(f"{service} lands in a later milestone")
-            return ash_pb2.Empty() if hasattr(ash_pb2, "Empty") else ash_pb2.ReloadResponse()
+    class LlmProviderServicer(ash_pb2_grpc.LlmProviderServicer):
+        async def ListProviders(self, request, context):  # noqa: N802
+            registry = get_registry()
+            infos = []
+            for name in registry.list_names():
+                cfg = registry.configs()[name]
+                try:
+                    caps = registry.capabilities(name)
+                except Exception as exc:  # noqa: BLE001
+                    _LOG.warning("capabilities(%s) failed: %s", name, exc)
+                    caps = None
+                info = ash_pb2.ProviderInfo(
+                    name=name,
+                    default_model=(caps.default_model if caps else cfg.model()),
+                    supports_tools=bool(caps.supports_tools) if caps else False,
+                    supports_vision=bool(caps.supports_vision) if caps else False,
+                    source=cfg.source,
+                )
+                infos.append(info)
+            return ash_pb2.ListProvidersResponse(providers=infos)
+
+        async def Capabilities(self, request, context):  # noqa: N802
+            registry = get_registry()
+            name = request.provider or registry.active_name()
+            try:
+                caps = registry.capabilities(name)
+            except KeyError:
+                await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown provider: {name}")
+            return ash_pb2.CapabilitiesResponse(
+                supports_tools=caps.supports_tools,
+                supports_vision=caps.supports_vision,
+                max_context_tokens=caps.max_context_tokens,
+                model=caps.default_model,
+            )
+
+        async def ChatStream(  # noqa: N802
+            self, request, context
+        ) -> AsyncIterator:
+            registry = get_registry()
+            name = request.provider or registry.active_name()
+            try:
+                provider = registry.get(name)
+            except KeyError:
+                await context.abort(grpc.StatusCode.NOT_FOUND, f"unknown provider: {name}")
+                return
+
+            py_req = PyChatRequest(
+                provider=name,
+                model=request.model,
+                messages=[
+                    PyChatMessage(role=m.role, content=m.content, tool_call_id=m.tool_call_id)
+                    for m in request.messages
+                ],
+                temperature=request.temperature or 0.0,
+            )
+
+            async for delta in provider.chat_stream(py_req):
+                if delta.error:
+                    # Represent provider errors as finish(stop_reason=error)
+                    # carried in a TurnFinish delta with the text describing
+                    # the error. This keeps the stream schema uniform.
+                    yield ash_pb2.ChatDelta(text=f"[error] {delta.error}")
+                    continue
+                if delta.is_finish:
+                    yield ash_pb2.ChatDelta(
+                        finish=ash_pb2.TurnFinish(
+                            stop_reason=delta.finish_reason,
+                            input_tokens=delta.input_tokens,
+                            output_tokens=delta.output_tokens,
+                        )
+                    )
+                    continue
+                if delta.text:
+                    yield ash_pb2.ChatDelta(text=delta.text)
+
+        async def Switch(self, request, context):  # noqa: N802
+            registry = get_registry()
+            try:
+                registry.switch(request.provider, request.model)
+            except KeyError as exc:
+                return ash_pb2.SwitchResponse(ok=False, message=str(exc))
+            return ash_pb2.SwitchResponse(
+                ok=True,
+                message=f"switched to {request.provider}"
+                + (f" ({request.model})" if request.model else ""),
+            )
+
+    def _unimplemented_unary(service: str):
+        async def _stub(self, request, context):  # noqa: ARG001
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                f"{service} lands in a later milestone",
+            )
 
         return _stub
 
-    class LlmProviderServicer(ash_pb2_grpc.LlmProviderServicer):
-        ListProviders = _unimplemented("LlmProvider.ListProviders")
-        Capabilities = _unimplemented("LlmProvider.Capabilities")
-        Switch = _unimplemented("LlmProvider.Switch")
+    def _unimplemented_stream(service: str):
+        async def _stub(self, request, context):  # noqa: ARG001
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                f"{service} lands in a later milestone",
+            )
+            if False:  # pragma: no cover — generator marker
+                yield
 
-        def ChatStream(self, request, context):  # noqa: N802
-            context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-            context.set_details("LlmProvider.ChatStream lands in M2")
-            return
-            yield  # pragma: no cover — generator marker
+        return _stub
 
     class SkillRegistryServicer(ash_pb2_grpc.SkillRegistryServicer):
-        List = _unimplemented("SkillRegistry.List")
-        Invoke = _unimplemented("SkillRegistry.Invoke")
-        Reload = _unimplemented("SkillRegistry.Reload")
-
-        def Watch(self, request, context):  # noqa: N802
-            context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-            context.set_details("SkillRegistry.Watch lands in M5")
-            return
-            yield  # pragma: no cover
+        List = _unimplemented_unary("SkillRegistry.List (M5)")
+        Invoke = _unimplemented_unary("SkillRegistry.Invoke (M5)")
+        Reload = _unimplemented_unary("SkillRegistry.Reload (M5)")
+        Watch = _unimplemented_stream("SkillRegistry.Watch (M5)")
 
     class CommandRegistryServicer(ash_pb2_grpc.CommandRegistryServicer):
-        List = _unimplemented("CommandRegistry.List")
-        Run = _unimplemented("CommandRegistry.Run")
-        Reload = _unimplemented("CommandRegistry.Reload")
+        List = _unimplemented_unary("CommandRegistry.List (M6)")
+        Run = _unimplemented_unary("CommandRegistry.Run (M6)")
+        Reload = _unimplemented_unary("CommandRegistry.Reload (M6)")
 
     class HarnessServicer(ash_pb2_grpc.HarnessServicer):
-        OnTurnStart = _unimplemented("Harness.OnTurnStart")
-        OnToolCall = _unimplemented("Harness.OnToolCall")
-        OnStreamDelta = _unimplemented("Harness.OnStreamDelta")
-        OnTurnEnd = _unimplemented("Harness.OnTurnEnd")
+        OnTurnStart = _unimplemented_unary("Harness.OnTurnStart (M3)")
+        OnToolCall = _unimplemented_unary("Harness.OnToolCall (M3)")
+        OnStreamDelta = _unimplemented_unary("Harness.OnStreamDelta (M3)")
+        OnTurnEnd = _unimplemented_unary("Harness.OnTurnEnd (M3)")
 
     class ToolRegistryServicer(ash_pb2_grpc.ToolRegistryServicer):
-        List = _unimplemented("ToolRegistry.List")
-        Invoke = _unimplemented("ToolRegistry.Invoke")
+        List = _unimplemented_unary("ToolRegistry.List (M3+)")
+        Invoke = _unimplemented_unary("ToolRegistry.Invoke (M3+)")
 
     return {
         "pb2": ash_pb2,
@@ -114,12 +201,11 @@ def _build_servicers():
     }
 
 
-def build_server(bind: str = DEFAULT_BIND) -> tuple[grpc.Server, str]:
-    """Create a configured, unstarted gRPC server. Returns (server, actual_bind)."""
+async def build_server(bind: str = DEFAULT_BIND) -> tuple[grpc_aio.Server, str]:
     servicers = _build_servicers()
     pb2_grpc = servicers["pb2_grpc"]
 
-    server = grpc.server(ThreadPoolExecutor(max_workers=8))
+    server = grpc_aio.server()
     pb2_grpc.add_HealthServicer_to_server(servicers["health"], server)
     pb2_grpc.add_LlmProviderServicer_to_server(servicers["llm"], server)
     pb2_grpc.add_SkillRegistryServicer_to_server(servicers["skills"], server)
@@ -128,39 +214,38 @@ def build_server(bind: str = DEFAULT_BIND) -> tuple[grpc.Server, str]:
     pb2_grpc.add_ToolRegistryServicer_to_server(servicers["tools"], server)
 
     port = server.add_insecure_port(bind)
-    # If the caller passed port 0, the effective port is whatever the OS picked.
     if bind.endswith(":0"):
         bind = bind.rsplit(":", 1)[0] + f":{port}"
     return server, bind
 
 
-def serve(bind: str = DEFAULT_BIND) -> int:
-    """Blocking entry point used by ``ashpy serve`` and supervisord."""
-    server, effective_bind = build_server(bind)
-    server.start()
+async def _serve_async(bind: str) -> int:
+    server, effective_bind = await build_server(bind)
+    await server.start()
     _log(f"ashpy gRPC server listening on {effective_bind}")
 
-    stop_event = asyncio.Event() if False else None  # kept for future async path
-    shutting_down = {"flag": False}
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    def _handle(signum, _frame):
-        if shutting_down["flag"]:
-            return
-        shutting_down["flag"] = True
-        _log(f"received signal {signum}, shutting down")
-        server.stop(grace=2.0)
+    def _handle_signal():
+        if not stop_event.is_set():
+            _log("shutdown signal received")
+            stop_event.set()
 
-    signal.signal(signal.SIGTERM, _handle)
-    signal.signal(signal.SIGINT, _handle)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:  # pragma: no cover — Windows
+            signal.signal(sig, lambda *_: _handle_signal())
 
-    try:
-        server.wait_for_termination()
-    except KeyboardInterrupt:
-        _handle(signal.SIGINT, None)
-        server.wait_for_termination()
-
+    await stop_event.wait()
+    await server.stop(grace=2.0)
     _log("sidecar stopped")
     return 0
+
+
+def serve(bind: str = DEFAULT_BIND) -> int:
+    return asyncio.run(_serve_async(bind))
 
 
 if __name__ == "__main__":
