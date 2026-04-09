@@ -139,7 +139,7 @@ impl SidecarClient {
     pub async fn on_stream_delta(&self, event: pb::DeltaEvent) -> Result<()> {
         use pb::harness_client::HarnessClient;
         let mut client = HarnessClient::new(self.channel.clone());
-        client
+        let _ = client
             .on_stream_delta(event)
             .await
             .context("Harness.OnStreamDelta RPC failed")?;

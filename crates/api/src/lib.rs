@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ash_ipc::{pb, SidecarClient};
-use ash_query::{QueryBackend, QueryEngine, Session, SidecarBackend, TurnSink};
+use ash_query::{
+    CancellationToken, QueryBackend, QueryEngine, Session, SidecarBackend, TurnSink,
+};
 use ash_tools::{ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, RwLock};
@@ -161,7 +163,8 @@ impl pb::query_host_server::QueryHost for QueryHostService {
 
         tokio::spawn(async move {
             let mut sink = ChannelSink::new(tx.clone());
-            let outcome = match engine.run_turn(&mut session, &mut sink).await {
+            let cancel = CancellationToken::new();
+            let outcome = match engine.run_turn(&mut session, &mut sink, cancel).await {
                 Ok(o) => o,
                 Err(err) => {
                     let _ = tx.send(Ok(pb::TurnDelta {

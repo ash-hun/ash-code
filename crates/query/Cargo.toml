@@ -8,8 +8,10 @@ license.workspace = true
 ash-core.workspace = true
 ash-tools.workspace = true
 ash-ipc.workspace = true
+ash-bus.workspace = true
 tokio = { workspace = true }
 tokio-stream.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 tonic.workspace = true
 anyhow.workspace = true
@@ -22,3 +24,4 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true }
+async-stream.workspace = true

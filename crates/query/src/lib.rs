@@ -19,11 +19,13 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use ash_bus::{BusEvent, SessionBus};
 use ash_ipc::pb;
 use ash_tools::{ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
+pub use tokio_util::sync::CancellationToken;
 
 pub const CRATE_NAME: &str = "ash-query";
 pub const DEFAULT_MAX_TURNS: usize = 10;
@@ -31,11 +33,22 @@ pub const DEFAULT_MAX_TURNS: usize = 10;
 /// Environment variable that overrides [`DEFAULT_MAX_TURNS`].
 pub const ENV_MAX_TURNS: &str = "ASH_MAX_TURNS";
 
+/// M8: opt-in toggle for `Harness.OnStreamDelta` per-token call site.
+/// Default off — see `docs/harness_onstreamdelta.md`.
+pub const ENV_STREAM_DELTA_HOOK: &str = "ASH_HARNESS_STREAM_DELTA";
+
 pub fn configured_max_turns() -> usize {
     std::env::var(ENV_MAX_TURNS)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MAX_TURNS)
+}
+
+pub fn stream_delta_hook_enabled() -> bool {
+    matches!(
+        std::env::var(ENV_STREAM_DELTA_HOOK).as_deref(),
+        Ok("on") | Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 // --- Session & messages ----------------------------------------------------
@@ -162,6 +175,13 @@ pub trait QueryBackend: Send + Sync {
     async fn on_turn_start(&self, ctx: pb::TurnContext) -> Result<pb::HookDecision>;
     async fn on_tool_call(&self, event: pb::ToolCallEvent) -> Result<pb::HookDecision>;
     async fn on_turn_end(&self, result: pb::TurnResult) -> Result<()>;
+
+    /// Optional fire-and-forget hook called once per streaming chunk
+    /// when `ASH_HARNESS_STREAM_DELTA=on`. Default impl is a no-op so
+    /// existing backends compile unchanged.
+    async fn on_stream_delta(&self, _event: pb::DeltaEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Blanket impl for the real `SidecarClient`. Keeps the query crate
@@ -189,6 +209,10 @@ impl QueryBackend for SidecarBackend {
     async fn on_turn_end(&self, result: pb::TurnResult) -> Result<()> {
         self.0.on_turn_end(result).await
     }
+
+    async fn on_stream_delta(&self, event: pb::DeltaEvent) -> Result<()> {
+        self.0.on_stream_delta(event).await
+    }
 }
 
 // --- Engine ----------------------------------------------------------------
@@ -196,7 +220,9 @@ impl QueryBackend for SidecarBackend {
 pub struct QueryEngine {
     backend: Arc<dyn QueryBackend>,
     tools: Arc<ToolRegistry>,
+    bus: Arc<SessionBus>,
     max_turns: usize,
+    stream_delta_hook: bool,
 }
 
 pub struct TurnOutcome {
@@ -211,7 +237,9 @@ impl QueryEngine {
         Self {
             backend,
             tools,
+            bus: Arc::new(SessionBus::new()),
             max_turns: configured_max_turns(),
+            stream_delta_hook: stream_delta_hook_enabled(),
         }
     }
 
@@ -220,15 +248,36 @@ impl QueryEngine {
         self
     }
 
+    pub fn with_bus(mut self, bus: Arc<SessionBus>) -> Self {
+        self.bus = bus;
+        self
+    }
+
+    pub fn bus(&self) -> Arc<SessionBus> {
+        self.bus.clone()
+    }
+
     pub async fn run_turn(
         &self,
         session: &mut Session,
         sink: &mut dyn TurnSink,
+        cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
         let mut turns_taken = 0;
         let mut stop_reason = String::from("end_turn");
 
         loop {
+            if cancel.is_cancelled() {
+                stop_reason = "cancelled".to_string();
+                sink.on_error("turn cancelled by user");
+                self.bus.publish(
+                    &session.id,
+                    BusEvent::Cancelled {
+                        reason: "cancelled before turn started".to_string(),
+                    },
+                );
+                break;
+            }
             if turns_taken >= self.max_turns {
                 stop_reason = "max_turns".to_string();
                 break;
@@ -266,28 +315,91 @@ impl QueryEngine {
                 tools: tool_specs,
             };
 
-            // --- stream consumption
+            // --- stream consumption (with mid-turn cancellation)
             let mut stream = self.backend.chat_stream(req).await?;
             let mut assistant_text = String::new();
             let mut tool_call: Option<pb::ToolCall> = None;
             let mut finish: Option<pb::TurnFinish> = None;
+            let mut cancelled_mid_stream = false;
 
-            while let Some(delta) = stream.next().await {
-                let delta = delta.map_err(|s| anyhow!("chat stream error: {s}"))?;
-                match delta.kind {
-                    Some(pb::chat_delta::Kind::Text(t)) => {
-                        assistant_text.push_str(&t);
-                        sink.on_text(&t);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled_mid_stream = true;
+                        // Drop the stream — tonic propagates cancellation
+                        // back through the gRPC channel.
+                        drop(stream);
+                        break;
                     }
-                    Some(pb::chat_delta::Kind::ToolCall(tc)) => {
-                        sink.on_tool_call(&tc.name, &String::from_utf8_lossy(&tc.arguments));
-                        tool_call = Some(tc);
+                    next = stream.next() => {
+                        let Some(delta) = next else { break; };
+                        let delta = delta.map_err(|s| anyhow!("chat stream error: {s}"))?;
+                        match delta.kind {
+                            Some(pb::chat_delta::Kind::Text(t)) => {
+                                assistant_text.push_str(&t);
+                                sink.on_text(&t);
+                                self.bus.publish(
+                                    &session.id,
+                                    BusEvent::AssistantText { text: t.clone() },
+                                );
+                                self.maybe_call_stream_delta_hook(
+                                    &session.id,
+                                    &turn_id,
+                                    pb::ChatDelta {
+                                        kind: Some(pb::chat_delta::Kind::Text(t)),
+                                    },
+                                );
+                            }
+                            Some(pb::chat_delta::Kind::ToolCall(tc)) => {
+                                sink.on_tool_call(&tc.name, &String::from_utf8_lossy(&tc.arguments));
+                                self.bus.publish(
+                                    &session.id,
+                                    BusEvent::ToolCall {
+                                        id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        args: String::from_utf8_lossy(&tc.arguments).into_owned(),
+                                    },
+                                );
+                                tool_call = Some(tc);
+                            }
+                            Some(pb::chat_delta::Kind::Finish(f)) => {
+                                finish = Some(f);
+                            }
+                            None => {}
+                        }
                     }
-                    Some(pb::chat_delta::Kind::Finish(f)) => {
-                        finish = Some(f);
-                    }
-                    None => {}
                 }
+            }
+
+            if cancelled_mid_stream {
+                stop_reason = "cancelled".to_string();
+                sink.on_error("turn cancelled by user");
+                if !assistant_text.is_empty() {
+                    let mut marked = assistant_text.clone();
+                    marked.push_str("\n\n[cancelled by user]");
+                    session.push_assistant_text(&marked);
+                }
+                self.bus.publish(
+                    &session.id,
+                    BusEvent::Cancelled {
+                        reason: format!("cancelled mid-stream after {} chars", assistant_text.len()),
+                    },
+                );
+                self.bus.publish(
+                    &session.id,
+                    BusEvent::Outcome {
+                        stop_reason: stop_reason.clone(),
+                        turns_taken,
+                        denied: false,
+                    },
+                );
+                return Ok(TurnOutcome {
+                    stop_reason,
+                    turns_taken,
+                    denied: false,
+                    denial_reason: String::new(),
+                });
             }
 
             // --- record assistant turn
@@ -352,6 +464,18 @@ impl QueryEngine {
                     Err(err) => ToolResult::err_text(format!("tool {} failed: {err}", tc.name)),
                 };
                 sink.on_tool_result(&tc.name, &result);
+                self.bus.publish(
+                    &session.id,
+                    BusEvent::ToolResult {
+                        name: tc.name.clone(),
+                        ok: result.ok,
+                        body: if result.ok {
+                            result.stdout.clone()
+                        } else {
+                            result.stderr.clone()
+                        },
+                    },
+                );
                 let payload = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string());
                 session.push_tool_result(&tc.id, payload);
                 continue;
@@ -361,12 +485,21 @@ impl QueryEngine {
             break;
         }
 
-        Ok(TurnOutcome {
-            stop_reason,
+        let outcome = TurnOutcome {
+            stop_reason: stop_reason.clone(),
             turns_taken,
             denied: false,
             denial_reason: String::new(),
-        })
+        };
+        self.bus.publish(
+            &session.id,
+            BusEvent::Outcome {
+                stop_reason,
+                turns_taken,
+                denied: false,
+            },
+        );
+        Ok(outcome)
     }
 
     fn tool_specs_for_request(&self) -> Vec<pb::ToolSpec> {
@@ -379,6 +512,30 @@ impl QueryEngine {
                 input_schema: serde_json::to_vec(&spec.input_schema).unwrap_or_default(),
             })
             .collect()
+    }
+
+    fn maybe_call_stream_delta_hook(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        delta: pb::ChatDelta,
+    ) {
+        if !self.stream_delta_hook {
+            return;
+        }
+        let backend = self.backend.clone();
+        let event = pb::DeltaEvent {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            delta: Some(delta),
+        };
+        // Fire-and-forget: any per-token gRPC stall must NOT block the
+        // streaming response. Errors logged at warn! and discarded.
+        tokio::spawn(async move {
+            if let Err(err) = backend.on_stream_delta(event).await {
+                tracing::warn!("on_stream_delta failed: {err:#}");
+            }
+        });
     }
 }
 
@@ -507,7 +664,10 @@ mod tests {
         }
 
         let mut sink = Collect::default();
-        let out = engine.run_turn(&mut session, &mut sink).await.unwrap();
+        let out = engine
+            .run_turn(&mut session, &mut sink, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(sink.text, "hello world");
         assert_eq!(sink.finish, "end_turn");
         assert_eq!(out.turns_taken, 1);
@@ -539,7 +699,10 @@ mod tests {
         let mut session = Session::new("s1", "fake", "fake-1");
         session.push_user("write the file");
 
-        engine.run_turn(&mut session, &mut NullSink).await.unwrap();
+        engine
+            .run_turn(&mut session, &mut NullSink, CancellationToken::new())
+            .await
+            .unwrap();
 
         let written = tokio::fs::read_to_string(&target).await.unwrap();
         assert_eq!(written, "ash-code was here");
@@ -565,7 +728,10 @@ mod tests {
         let mut session = Session::new("s1", "fake", "fake-1");
         session.push_user("run a command");
 
-        engine.run_turn(&mut session, &mut NullSink).await.unwrap();
+        engine
+            .run_turn(&mut session, &mut NullSink, CancellationToken::new())
+            .await
+            .unwrap();
         // Tool result message should carry the denial text — tool was blocked
         // and the engine continues into the next (empty) turn where it
         // naturally terminates.
@@ -590,8 +756,98 @@ mod tests {
             .with_max_turns(3);
         let mut session = Session::new("s1", "fake", "fake-1");
         session.push_user("loop forever");
-        let out = engine.run_turn(&mut session, &mut NullSink).await.unwrap();
+        let out = engine
+            .run_turn(&mut session, &mut NullSink, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(out.turns_taken, 3);
         assert_eq!(out.stop_reason, "max_turns");
+    }
+
+    // --- M8: cancellation tests ------------------------------------------
+
+    #[tokio::test]
+    async fn cancel_before_turn_returns_cancelled() {
+        let backend = Arc::new(ScriptedBackend::default());
+        backend.push_turn(vec![text_delta("never sent"), finish_delta("end_turn")]);
+        let engine = QueryEngine::new(backend, Arc::new(ToolRegistry::with_builtins()));
+        let mut session = Session::new("s1", "fake", "fake-1");
+        session.push_user("hi");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = engine.run_turn(&mut session, &mut NullSink, cancel).await.unwrap();
+        assert_eq!(out.stop_reason, "cancelled");
+        assert_eq!(out.turns_taken, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_stream_preserves_partial_text() {
+        // Backend that yields three text deltas with a small async pause
+        // between each so the cancellation has a moment to fire.
+        struct SlowBackend;
+        #[async_trait]
+        impl QueryBackend for SlowBackend {
+            async fn chat_stream(
+                &self,
+                _req: pb::ChatRequest,
+            ) -> Result<BoxStream<'static, Result<pb::ChatDelta, tonic::Status>>> {
+                use async_stream::stream as build_stream;
+                let s = build_stream! {
+                    for chunk in ["hel", "lo ", "wor", "ld"] {
+                        yield Ok(pb::ChatDelta {
+                            kind: Some(pb::chat_delta::Kind::Text(chunk.to_string())),
+                        });
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                };
+                Ok(Box::pin(s))
+            }
+            async fn on_turn_start(&self, _ctx: pb::TurnContext) -> Result<pb::HookDecision> {
+                Ok(pb::HookDecision { kind: pb::hook_decision::Kind::Allow as i32, ..Default::default() })
+            }
+            async fn on_tool_call(&self, _e: pb::ToolCallEvent) -> Result<pb::HookDecision> {
+                Ok(pb::HookDecision { kind: pb::hook_decision::Kind::Allow as i32, ..Default::default() })
+            }
+            async fn on_turn_end(&self, _r: pb::TurnResult) -> Result<()> { Ok(()) }
+        }
+
+        let engine = QueryEngine::new(Arc::new(SlowBackend), Arc::new(ToolRegistry::with_builtins()));
+        let mut session = Session::new("s2", "fake", "fake-1");
+        session.push_user("write a long story");
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            cancel_clone.cancel();
+        });
+        let out = engine.run_turn(&mut session, &mut NullSink, cancel).await.unwrap();
+        assert_eq!(out.stop_reason, "cancelled");
+        // Some partial text should be persisted with the cancelled marker.
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(last.content.contains("[cancelled by user]"));
+    }
+
+    #[tokio::test]
+    async fn bus_publishes_outcome_event() {
+        let backend = Arc::new(ScriptedBackend::default());
+        backend.push_turn(vec![text_delta("ok"), finish_delta("end_turn")]);
+        let engine = QueryEngine::new(backend, Arc::new(ToolRegistry::with_builtins()));
+        let bus = engine.bus();
+        let mut rx = bus.subscribe("bus-test");
+        let mut session = Session::new("bus-test", "fake", "fake-1");
+        session.push_user("hi");
+        let _ = engine.run_turn(&mut session, &mut NullSink, CancellationToken::new()).await.unwrap();
+
+        // Drain events until we hit the Outcome marker.
+        let mut saw_outcome = false;
+        while let Ok(event) = rx.try_recv() {
+            if let BusEvent::Outcome { stop_reason, .. } = event {
+                assert_eq!(stop_reason, "end_turn");
+                saw_outcome = true;
+            }
+        }
+        assert!(saw_outcome, "expected an Outcome event on the bus");
     }
 }

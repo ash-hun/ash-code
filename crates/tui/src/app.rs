@@ -1,6 +1,7 @@
 //! Pure state and logic for the TUI. No I/O, no ratatui, no tokio —
 //! everything here is deterministic and unit-testable.
 
+use ash_query::CancellationToken;
 use ash_tools::ToolResult;
 use tokio::sync::oneshot;
 
@@ -61,6 +62,8 @@ pub struct AppState {
     pub mode: Mode,
     pub running_turn: bool,
     pub should_quit: bool,
+    /// M8: cancellation token for the in-flight turn (None when idle).
+    pub current_cancel: Option<CancellationToken>,
 
     // Read-only meta for the header/footer
     pub provider: String,
@@ -78,10 +81,21 @@ impl AppState {
             mode: Mode::Normal,
             running_turn: false,
             should_quit: false,
+            current_cancel: None,
             provider,
             model,
             session_id,
             turns_taken: 0,
+        }
+    }
+
+    /// Cancel the current turn if one is running. Returns true on hit.
+    pub fn request_cancel_turn(&mut self) -> bool {
+        if let Some(token) = &self.current_cancel {
+            token.cancel();
+            true
+        } else {
+            false
         }
     }
 

@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 
 use anyhow::Result;
-use ash_query::{QueryEngine, Session, TurnSink};
+use ash_query::{CancellationToken, QueryEngine, Session, TurnSink};
 use ash_tools::ToolResult as RsToolResult;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode,
@@ -148,6 +148,7 @@ pub async fn run_event_loop(
                     TurnEvent::Error(msg) => state.push_error(msg),
                     TurnEvent::Done(result) => {
                         state.running_turn = false;
+                        state.current_cancel = None;
                         match result {
                             Ok((new_session, summary)) => {
                                 session = new_session;
@@ -242,7 +243,13 @@ fn handle_key(
         KeyCode::PageDown => state.scroll_down(5),
         KeyCode::End => state.scroll_bottom(),
         KeyCode::Esc => {
-            if state.input.is_empty() && !state.running_turn {
+            // M8: priority shifts —
+            //   running_turn  → cancel current turn (process stays alive)
+            //   input empty   → quit
+            //   input filled  → no-op
+            if state.running_turn {
+                state.request_cancel_turn();
+            } else if state.input.is_empty() {
                 state.should_quit = true;
             }
         }
@@ -261,11 +268,13 @@ fn spawn_turn(
     state.push_user(prompt.clone());
     session.push_user(&prompt);
     state.running_turn = true;
+    let cancel = CancellationToken::new();
+    state.current_cancel = Some(cancel.clone());
 
     let mut working_session = session.clone();
     tokio::spawn(async move {
         let mut sink = ChannelSink::new(turn_tx.clone());
-        let outcome = engine.run_turn(&mut working_session, &mut sink).await;
+        let outcome = engine.run_turn(&mut working_session, &mut sink, cancel).await;
         let msg = match outcome {
             Ok(outcome) => Ok((
                 working_session,
