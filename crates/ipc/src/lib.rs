@@ -146,6 +146,68 @@ impl SidecarClient {
         Ok(())
     }
 
+    // --- SkillRegistry / CommandRegistry (M5/M6) ----------------------------
+
+    pub async fn list_skills(&self) -> Result<Vec<pb::Skill>> {
+        use pb::skill_registry_client::SkillRegistryClient;
+        let mut client = SkillRegistryClient::new(self.channel.clone());
+        let resp = client
+            .list(pb::ListSkillsRequest {})
+            .await
+            .context("SkillRegistry.List RPC failed")?
+            .into_inner();
+        Ok(resp.skills)
+    }
+
+    pub async fn invoke_skill(
+        &self,
+        name: &str,
+        args: std::collections::HashMap<String, String>,
+    ) -> Result<pb::InvokeSkillResponse> {
+        use pb::skill_registry_client::SkillRegistryClient;
+        let mut client = SkillRegistryClient::new(self.channel.clone());
+        let resp = client
+            .invoke(pb::InvokeSkillRequest {
+                name: name.to_string(),
+                args,
+                context: std::collections::HashMap::new(),
+            })
+            .await
+            .context("SkillRegistry.Invoke RPC failed")?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn render_command(
+        &self,
+        name: &str,
+        args: std::collections::HashMap<String, String>,
+    ) -> Result<pb::RunCommandResponse> {
+        use pb::command_registry_client::CommandRegistryClient;
+        let mut client = CommandRegistryClient::new(self.channel.clone());
+        let resp = client
+            .run(pb::RunCommandRequest {
+                name: name.to_string(),
+                args,
+                context: std::collections::HashMap::new(),
+            })
+            .await
+            .context("CommandRegistry.Run RPC failed")?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn list_commands(&self) -> Result<Vec<pb::Command>> {
+        use pb::command_registry_client::CommandRegistryClient;
+        let mut client = CommandRegistryClient::new(self.channel.clone());
+        let resp = client
+            .list(pb::ListCommandsRequest {})
+            .await
+            .context("CommandRegistry.List RPC failed")?
+            .into_inner();
+        Ok(resp.commands)
+    }
+
     pub async fn on_turn_end(&self, result: pb::TurnResult) -> Result<()> {
         use pb::harness_client::HarnessClient;
         let mut client = HarnessClient::new(self.channel.clone());

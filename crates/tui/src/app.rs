@@ -19,11 +19,85 @@ pub enum ChatLine {
     Denial { tool: String, reason: String },
 }
 
+/// An entry in the slash palette (command or skill).
+#[derive(Debug, Clone)]
+pub struct PaletteEntry {
+    pub kind: PaletteKind,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaletteKind {
+    Command,
+    Skill,
+}
+
+/// State for the slash command palette overlay.
+#[derive(Debug)]
+pub struct SlashPaletteState {
+    pub entries: Vec<PaletteEntry>,
+    pub filtered: Vec<usize>, // indices into entries
+    pub selected: usize,
+    pub filter: String, // characters typed after '/'
+}
+
+impl SlashPaletteState {
+    pub fn new(entries: Vec<PaletteEntry>) -> Self {
+        let filtered: Vec<usize> = (0..entries.len()).collect();
+        Self {
+            entries,
+            filtered,
+            selected: 0,
+            filter: String::new(),
+        }
+    }
+
+    pub fn update_filter(&mut self, filter: &str) {
+        self.filter = filter.to_string();
+        let lower = filter.to_lowercase();
+        self.filtered = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                lower.is_empty()
+                    || e.name.to_lowercase().contains(&lower)
+                    || e.description.to_lowercase().contains(&lower)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // Clamp selection
+        if self.selected >= self.filtered.len() {
+            self.selected = 0;
+        }
+    }
+
+    pub fn selected_entry(&self) -> Option<&PaletteEntry> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.entries.get(i))
+    }
+
+    pub fn select_next(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = (self.selected + 1) % self.filtered.len();
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = (self.selected + self.filtered.len() - 1) % self.filtered.len();
+        }
+    }
+}
+
 /// Top-level mode of the UI. Only one is active at a time.
 #[derive(Debug)]
 pub enum Mode {
     Normal,
     Approval(ApprovalState),
+    SlashPalette(SlashPaletteState),
 }
 
 /// State captured while a bash approval dialog is open.
@@ -70,6 +144,11 @@ pub struct AppState {
     pub model: String,
     pub session_id: String,
     pub turns_taken: usize,
+
+    /// Cached palette entries loaded at startup.
+    pub palette_entries: Vec<PaletteEntry>,
+    /// Frame counter for spinner animation.
+    pub tick: usize,
 }
 
 impl AppState {
@@ -86,6 +165,8 @@ impl AppState {
             model,
             session_id,
             turns_taken: 0,
+            palette_entries: Vec::new(),
+            tick: 0,
         }
     }
 
@@ -108,7 +189,22 @@ impl AppState {
             }
             return;
         }
+        if let Mode::SlashPalette(palette) = &mut self.mode {
+            // Typing updates the filter (text after the last '/')
+            self.input.push(c);
+            let filter = self.input.rsplit('/').next().unwrap_or("").to_string();
+            palette.update_filter(&filter);
+            return;
+        }
         if self.running_turn {
+            return;
+        }
+        // Open slash palette when '/' is typed anywhere
+        if c == '/' && !self.palette_entries.is_empty() {
+            self.input.push(c);
+            self.mode = Mode::SlashPalette(SlashPaletteState::new(
+                self.palette_entries.clone(),
+            ));
             return;
         }
         self.input.push(c);
@@ -119,6 +215,17 @@ impl AppState {
             if approval.editing_custom {
                 approval.custom_input.pop();
             }
+            return;
+        }
+        if let Mode::SlashPalette(palette) = &mut self.mode {
+            self.input.pop();
+            // Close palette if the last '/' was deleted
+            if !self.input.contains('/') {
+                self.mode = Mode::Normal;
+                return;
+            }
+            let filter = self.input.rsplit('/').next().unwrap_or("").to_string();
+            palette.update_filter(&filter);
             return;
         }
         if self.running_turn {
@@ -142,9 +249,12 @@ impl AppState {
     }
 
     // --- chat log mutation -------------------------------------------------
+    // Every mutation auto-scrolls to bottom (scroll=0) so the latest
+    // content is always visible during streaming.
 
     pub fn push_user(&mut self, text: String) {
         self.chat.push(ChatLine::User(text));
+        self.scroll = 0;
     }
 
     /// Append streaming text from the assistant.
@@ -156,6 +266,7 @@ impl AppState {
         } else {
             self.chat.push(ChatLine::Assistant(text.to_string()));
         }
+        self.scroll = 0;
     }
 
     pub fn push_tool_call(&mut self, name: &str, args: &str) {
@@ -163,6 +274,7 @@ impl AppState {
             name: name.to_string(),
             args: args.to_string(),
         });
+        self.scroll = 0;
     }
 
     pub fn push_tool_result(&mut self, name: &str, result: &ToolResult) {
@@ -177,6 +289,7 @@ impl AppState {
             ok: result.ok,
             body: snippet,
         });
+        self.scroll = 0;
     }
 
     pub fn push_finish(&mut self, stop_reason: &str, input_tokens: i32, output_tokens: i32) {
@@ -185,14 +298,17 @@ impl AppState {
             input_tokens,
             output_tokens,
         });
+        self.scroll = 0;
     }
 
     pub fn push_error(&mut self, message: String) {
         self.chat.push(ChatLine::Error(message));
+        self.scroll = 0;
     }
 
     pub fn push_denial(&mut self, tool: String, reason: String) {
         self.chat.push(ChatLine::Denial { tool, reason });
+        self.scroll = 0;
     }
 
     // --- approval mode ----------------------------------------------------
@@ -261,6 +377,45 @@ impl AppState {
             });
         }
         self.mode = Mode::Normal;
+    }
+
+    // --- slash palette ----------------------------------------------------
+
+    /// Select the current palette entry and place its name in the input as
+    /// `/<name> `, then close the palette.
+    pub fn palette_confirm(&mut self) -> Option<String> {
+        if let Mode::SlashPalette(palette) = &self.mode {
+            if let Some(entry) = palette.selected_entry() {
+                let name = entry.name.clone();
+                // Replace from the last '/' onward with /<name>
+                if let Some(slash_pos) = self.input.rfind('/') {
+                    self.input.truncate(slash_pos);
+                }
+                self.input.push_str(&format!("/{name} "));
+                self.mode = Mode::Normal;
+                return Some(name);
+            }
+        }
+        self.palette_dismiss();
+        None
+    }
+
+    pub fn palette_dismiss(&mut self) {
+        if matches!(self.mode, Mode::SlashPalette(_)) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    pub fn palette_next(&mut self) {
+        if let Mode::SlashPalette(p) = &mut self.mode {
+            p.select_next();
+        }
+    }
+
+    pub fn palette_prev(&mut self) {
+        if let Mode::SlashPalette(p) = &mut self.mode {
+            p.select_prev();
+        }
     }
 
     // --- scroll -----------------------------------------------------------

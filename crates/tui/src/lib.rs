@@ -20,7 +20,7 @@ pub mod backend;
 pub mod event;
 pub mod ui;
 
-pub use app::{AppState, ChatLine, Mode};
+pub use app::{AppState, ChatLine, Mode, PaletteEntry, PaletteKind};
 pub use backend::TuiBackend;
 
 pub const CRATE_NAME: &str = "ash-tui";
@@ -50,6 +50,11 @@ pub async fn run(config: TuiConfig) -> Result<()> {
     let sidecar = connect_with_retry(&config.sidecar_endpoint, 10, Duration::from_millis(300))
         .await
         .with_context(|| format!("could not reach sidecar at {}", config.sidecar_endpoint))?;
+
+    // Load palette entries (commands + skills) from sidecar.
+    let palette_entries = load_palette_entries(&sidecar).await;
+
+    let sidecar_for_palette = sidecar.clone();
     let inner_backend: Arc<dyn QueryBackend> = Arc::new(SidecarBackend(sidecar));
 
     // Approval channel: TuiBackend → UI main loop
@@ -69,7 +74,41 @@ pub async fn run(config: TuiConfig) -> Result<()> {
         &config.model,
     );
 
-    event::run_event_loop(engine, session, config, approval_rx).await
+    event::run_event_loop(engine, session, config, approval_rx, palette_entries, sidecar_for_palette).await
+}
+
+async fn load_palette_entries(sidecar: &ash_ipc::SidecarClient) -> Vec<PaletteEntry> {
+    let mut entries = Vec::new();
+
+    // Load commands
+    match sidecar.list_commands().await {
+        Ok(cmds) => {
+            for c in cmds {
+                entries.push(PaletteEntry {
+                    kind: PaletteKind::Command,
+                    name: c.name,
+                    description: c.description,
+                });
+            }
+        }
+        Err(e) => tracing::warn!("failed to load commands for palette: {e:#}"),
+    }
+
+    // Load skills
+    match sidecar.list_skills().await {
+        Ok(skills) => {
+            for s in skills {
+                entries.push(PaletteEntry {
+                    kind: PaletteKind::Skill,
+                    name: s.name,
+                    description: s.description,
+                });
+            }
+        }
+        Err(e) => tracing::warn!("failed to load skills for palette: {e:#}"),
+    }
+
+    entries
 }
 
 async fn connect_with_retry(
