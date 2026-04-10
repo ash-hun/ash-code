@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, ChatLine, Mode, PaletteKind};
 
@@ -43,76 +44,68 @@ pub fn render(f: &mut Frame, state: &AppState) {
 // ---------------------------------------------------------------------------
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
-    // Top line: version banner
-    let top_line = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // version
-            Constraint::Min(1),   // two-column body
-        ])
-        .split(area);
+    let orange = Color::Rgb(255, 120, 50);
 
-    let version_line = Line::from(vec![
-        Span::styled(
-            "─── ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("ash-code v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(Color::Rgb(255, 120, 50)).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " ───",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(version_line), top_line[0]);
+    // Outer box with orange border + version in title
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(orange))
+        .title(Span::styled(
+            format!(" ash-code v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // Two-column body
+    // Two-column inside the box
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40), // left: welcome + model
-            Constraint::Percentage(60), // right: tips + activity
+            Constraint::Percentage(40),
+            Constraint::Percentage(60),
         ])
-        .split(top_line[1]);
+        .split(inner);
 
-    // Left column: user info
+    // Left column: welcome + model info
     let model_display = if state.model.is_empty() {
         "(default)".to_string()
     } else {
         state.model.clone()
     };
     let left_lines = vec![
-        Line::from(""),
         Line::from(Span::styled(
-            "    Welcome back!",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            "  Welcome back!",
+            Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(
-                format!("{} · {}", state.provider, model_display),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(
-                format!("session: {}", &state.session_id[..state.session_id.len().min(20)]),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
+        Line::from(Span::styled(
+            format!("  {} · {}", state.provider, model_display),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  session: {}", &state.session_id[..state.session_id.len().min(24)]),
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
     f.render_widget(Paragraph::new(left_lines), cols[0]);
 
-    // Right column: tips + recent activity
+    // Orange vertical divider between columns
+    let divider_x = cols[1].x;
+    for y in cols[1].y..cols[1].y + cols[1].height {
+        let cell = ratatui::buffer::Cell::default();
+        let buf = f.buffer_mut();
+        if divider_x > 0 && (divider_x as usize) < buf.area.width as usize {
+            buf[(divider_x - 1, y)]
+                .set_char('│')
+                .set_style(Style::default().fg(orange));
+        }
+    }
+
+    // Right column: tips + activity
     let right_lines = vec![
-        Line::from(""),
         Line::from(Span::styled(
             "Tips for getting started",
-            Style::default().fg(Color::Rgb(255, 120, 50)).add_modifier(Modifier::BOLD),
+            Style::default().fg(orange).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "Type a prompt below and press Enter to send.",
@@ -124,13 +117,14 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         )),
         Line::from(Span::styled(
             "Recent activity",
-            Style::default().fg(Color::Rgb(255, 120, 50)).add_modifier(Modifier::BOLD),
+            Style::default().fg(orange).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             if state.chat.is_empty() {
                 "No recent activity".to_string()
             } else {
-                format!("{} message(s) this session", state.chat.len())
+                let visible = state.chat.iter().filter(|c| !matches!(c, ChatLine::Finish { .. })).count();
+                format!("{} message(s) this session", visible)
             },
             Style::default().fg(Color::DarkGray),
         )),
@@ -151,29 +145,24 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
         height: area.height,
     };
 
+    let max_args_len = padded.width.saturating_sub(20) as usize;
+
     let mut lines: Vec<Line> = Vec::with_capacity(state.chat.len() * 2);
-    for entry in &state.chat {
+    for (i, entry) in state.chat.iter().enumerate() {
         match entry {
             ChatLine::User(text) => {
-                lines.push(Line::from(""));
+                // Blank line before user message = turn separator (skip first)
+                if i > 0 {
+                    lines.push(Line::from(""));
+                }
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "● ",
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(
-                        text.clone(),
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled("● ", Style::default().fg(Color::Cyan)),
+                    Span::styled(text.clone(), Style::default().fg(Color::White)),
                 ]));
             }
             ChatLine::Assistant(text) => {
-                lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "● ",
-                        Style::default().fg(Color::Magenta),
-                    ),
+                    Span::styled("● ", Style::default().fg(Color::Magenta)),
                     Span::styled(
                         "ash-code",
                         Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -190,16 +179,17 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
                 }
             }
             ChatLine::ToolCall { name, args } => {
+                let args_display = truncate_str(
+                    &args.replace('\n', " "),
+                    max_args_len,
+                );
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "  ▸ ",
-                        Style::default().fg(Color::Yellow),
-                    ),
+                    Span::styled("  ▸ ", Style::default().fg(Color::Yellow)),
                     Span::styled(
                         format!("{name} "),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(args.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(args_display, Style::default().fg(Color::DarkGray)),
                 ]));
             }
             ChatLine::ToolResult { name, ok, body } => {
@@ -207,43 +197,28 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
                 let icon = if *ok { "✓" } else { "✗" };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("  {icon} {name} "),
+                        format!("  {icon} {name}"),
                         Style::default().fg(color),
                     ),
                 ]));
-                for line in body.lines().take(8) {
+                for line in body.lines().take(4) {
                     lines.push(Line::from(Span::styled(
-                        format!("    {line}"),
+                        format!("    {}", truncate_str(line, max_args_len)),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
             }
-            ChatLine::Finish { stop_reason, input_tokens, output_tokens } => {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  [{stop_reason} in={input_tokens} out={output_tokens}]"
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+            // Hidden: Finish meta and tool_use tags are not rendered
+            ChatLine::Finish { .. } => {}
             ChatLine::Error(msg) => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "  ✖ ",
-                        Style::default().fg(Color::Red),
-                    ),
-                    Span::styled(
-                        msg.clone(),
-                        Style::default().fg(Color::Red),
-                    ),
+                    Span::styled("  ✖ ", Style::default().fg(Color::Red)),
+                    Span::styled(msg.clone(), Style::default().fg(Color::Red)),
                 ]));
             }
             ChatLine::Denial { tool, reason } => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "  ⊘ ",
-                        Style::default().fg(Color::Red),
-                    ),
+                    Span::styled("  ⊘ ", Style::default().fg(Color::Red)),
                     Span::styled(
                         format!("{tool} denied: {reason}"),
                         Style::default().fg(Color::Red),
@@ -253,11 +228,26 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    // Estimate wrapped line count for accurate scroll-to-bottom.
+    // Spinner during streaming
+    if state.running_turn {
+        let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let spinner = spinners[state.tick % spinners.len()];
+        lines.push(Line::from(Span::styled(
+            format!("  {spinner} "),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
+
+    // Estimate wrapped line count using Unicode display width for
+    // accurate scroll-to-bottom (Korean, emoji, etc. are 2 columns wide).
     let wrap_width = padded.width.max(1) as usize;
     let mut visual_lines: u16 = 0;
     for line in &lines {
-        let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        let line_width: usize = line
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
         if line_width == 0 {
             visual_lines += 1;
         } else {
@@ -317,10 +307,12 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState) {
         state.model.clone()
     };
 
+    let spinners = ['◐', '◓', '◑', '◒'];
     let left = if state.running_turn {
-        "Esc cancel · Ctrl-C quit"
+        let s = spinners[state.tick % spinners.len()];
+        format!("{s} generating...  Esc cancel · Ctrl-C quit")
     } else {
-        "? for shortcuts"
+        "? for shortcuts".to_string()
     };
     let right = format!(
         "● {} · {} · turns {}",
@@ -329,20 +321,22 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Pad the right text to right-align it
     let total_width = area.width as usize;
-    let left_len = left.len();
-    let right_len = right.len();
-    let padding = total_width.saturating_sub(left_len + right_len + 2);
+    let left_display = format!(" {left}");
+    let right_display = format!("{right} ");
+    let left_len = UnicodeWidthStr::width(left_display.as_str());
+    let right_len = UnicodeWidthStr::width(right_display.as_str());
+    let padding = total_width.saturating_sub(left_len + right_len);
+
+    let left_style = if state.running_turn {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let line = Line::from(vec![
-        Span::styled(
-            format!(" {left}"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(left_display, left_style),
         Span::raw(" ".repeat(padding)),
-        Span::styled(
-            format!("{right} "),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(right_display, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -499,6 +493,14 @@ fn render_slash_palette(f: &mut Frame, chat_area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray));
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, palette_area);
+}
+
+fn format_tokens(n: i32) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{n}")
+    }
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

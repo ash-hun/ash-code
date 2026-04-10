@@ -147,6 +147,8 @@ pub struct AppState {
 
     /// Cached palette entries loaded at startup.
     pub palette_entries: Vec<PaletteEntry>,
+    /// Frame counter for spinner animation.
+    pub tick: usize,
 }
 
 impl AppState {
@@ -164,6 +166,7 @@ impl AppState {
             session_id,
             turns_taken: 0,
             palette_entries: Vec::new(),
+            tick: 0,
         }
     }
 
@@ -187,17 +190,17 @@ impl AppState {
             return;
         }
         if let Mode::SlashPalette(palette) = &mut self.mode {
-            // Typing updates the filter
+            // Typing updates the filter (text after the last '/')
             self.input.push(c);
-            let filter = self.input.strip_prefix('/').unwrap_or(&self.input).to_string();
+            let filter = self.input.rsplit('/').next().unwrap_or("").to_string();
             palette.update_filter(&filter);
             return;
         }
         if self.running_turn {
             return;
         }
-        // Open slash palette when '/' is typed on empty input
-        if c == '/' && self.input.is_empty() && !self.palette_entries.is_empty() {
+        // Open slash palette when '/' is typed anywhere
+        if c == '/' && !self.palette_entries.is_empty() {
             self.input.push(c);
             self.mode = Mode::SlashPalette(SlashPaletteState::new(
                 self.palette_entries.clone(),
@@ -216,12 +219,12 @@ impl AppState {
         }
         if let Mode::SlashPalette(palette) = &mut self.mode {
             self.input.pop();
-            if self.input.is_empty() {
-                // Closed the palette by deleting '/'
+            // Close palette if the last '/' was deleted
+            if !self.input.contains('/') {
                 self.mode = Mode::Normal;
                 return;
             }
-            let filter = self.input.strip_prefix('/').unwrap_or(&self.input).to_string();
+            let filter = self.input.rsplit('/').next().unwrap_or("").to_string();
             palette.update_filter(&filter);
             return;
         }
@@ -246,9 +249,12 @@ impl AppState {
     }
 
     // --- chat log mutation -------------------------------------------------
+    // Every mutation auto-scrolls to bottom (scroll=0) so the latest
+    // content is always visible during streaming.
 
     pub fn push_user(&mut self, text: String) {
         self.chat.push(ChatLine::User(text));
+        self.scroll = 0;
     }
 
     /// Append streaming text from the assistant.
@@ -260,6 +266,7 @@ impl AppState {
         } else {
             self.chat.push(ChatLine::Assistant(text.to_string()));
         }
+        self.scroll = 0;
     }
 
     pub fn push_tool_call(&mut self, name: &str, args: &str) {
@@ -267,6 +274,7 @@ impl AppState {
             name: name.to_string(),
             args: args.to_string(),
         });
+        self.scroll = 0;
     }
 
     pub fn push_tool_result(&mut self, name: &str, result: &ToolResult) {
@@ -281,6 +289,7 @@ impl AppState {
             ok: result.ok,
             body: snippet,
         });
+        self.scroll = 0;
     }
 
     pub fn push_finish(&mut self, stop_reason: &str, input_tokens: i32, output_tokens: i32) {
@@ -289,14 +298,17 @@ impl AppState {
             input_tokens,
             output_tokens,
         });
+        self.scroll = 0;
     }
 
     pub fn push_error(&mut self, message: String) {
         self.chat.push(ChatLine::Error(message));
+        self.scroll = 0;
     }
 
     pub fn push_denial(&mut self, tool: String, reason: String) {
         self.chat.push(ChatLine::Denial { tool, reason });
+        self.scroll = 0;
     }
 
     // --- approval mode ----------------------------------------------------
@@ -375,7 +387,11 @@ impl AppState {
         if let Mode::SlashPalette(palette) = &self.mode {
             if let Some(entry) = palette.selected_entry() {
                 let name = entry.name.clone();
-                self.input = format!("/{name} ");
+                // Replace from the last '/' onward with /<name>
+                if let Some(slash_pos) = self.input.rfind('/') {
+                    self.input.truncate(slash_pos);
+                }
+                self.input.push_str(&format!("/{name} "));
                 self.mode = Mode::Normal;
                 return Some(name);
             }

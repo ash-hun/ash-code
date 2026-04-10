@@ -121,11 +121,21 @@ pub async fn run_event_loop(
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
     let mut crossterm_events = EventStream::new();
 
+    // Tick interval for spinner animation (100ms)
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+
     // Initial draw
     terminal.draw(|f| ui::render(f, &state))?;
 
     loop {
         tokio::select! {
+            _ = tick_interval.tick() => {
+                if state.running_turn {
+                    state.tick = state.tick.wrapping_add(1);
+                    terminal.draw(|f| ui::render(f, &state))?;
+                }
+                continue;
+            }
             Some(ct_event) = crossterm_events.next() => {
                 if let Ok(CtEvent::Key(key)) = ct_event {
                     if key.kind != KeyEventKind::Press {
