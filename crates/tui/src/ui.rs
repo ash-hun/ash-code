@@ -1,6 +1,6 @@
-//! ratatui frame rendering.
+//! ratatui frame rendering — Claude Code-inspired minimal UI.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -15,9 +15,9 @@ pub fn render(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),   // header (banner + tips + recent activity)
+            Constraint::Length(8),   // header (two-column)
             Constraint::Min(5),      // chat body
-            Constraint::Length(3),   // input
+            Constraint::Length(2),   // input
             Constraint::Length(1),   // status bar
         ])
         .split(area);
@@ -34,78 +34,143 @@ pub fn render(f: &mut Frame, state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
-// Header — claurst-style banner + tips + recent activity (Q3=b)
+// Header — two-column layout inspired by Claude Code
 // ---------------------------------------------------------------------------
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" ash-code v{} ", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-    ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // Top line: version banner
+    let top_line = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // version
+            Constraint::Min(1),   // two-column body
+        ])
+        .split(area);
 
-    let lines = vec![
+    let version_line = Line::from(vec![
+        Span::styled(
+            "─── ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("ash-code v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::Rgb(255, 120, 50)).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ───",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(version_line), top_line[0]);
+
+    // Two-column body
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40), // left: welcome + model
+            Constraint::Percentage(60), // right: tips + activity
+        ])
+        .split(top_line[1]);
+
+    // Left column: user info
+    let model_display = if state.model.is_empty() {
+        "(default)".to_string()
+    } else {
+        state.model.clone()
+    };
+    let left_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "    Welcome back!",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
         Line::from(vec![
+            Span::styled("    ", Style::default()),
             Span::styled(
-                "Welcome back!",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                format!("{} · {}", state.provider, model_display),
+                Style::default().fg(Color::DarkGray),
             ),
-            Span::raw("  Start with small features or bug fixes, let ash-code propose a plan, and verify."),
         ]),
         Line::from(vec![
+            Span::styled("    ", Style::default()),
             Span::styled(
-                "Tips for getting started",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::raw("  · Type a prompt below and press Enter to send.")),
-        Line::from(Span::raw("  · bash commands trigger an approval dialog — [1] Yes, [2] No, [3] feedback.")),
-        Line::from(vec![
-            Span::styled(
-                "Recent activity",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                if state.chat.is_empty() {
-                    "No recent activity".to_string()
-                } else {
-                    format!("{} message(s) this session", state.chat.len())
-                },
+                format!("session: {}", &state.session_id[..state.session_id.len().min(20)]),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
     ];
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(paragraph, inner);
+    f.render_widget(Paragraph::new(left_lines), cols[0]);
+
+    // Right column: tips + recent activity
+    let right_lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tips for getting started",
+            Style::default().fg(Color::Rgb(255, 120, 50)).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Type a prompt below and press Enter to send.",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "bash commands trigger an approval dialog.",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "Recent activity",
+            Style::default().fg(Color::Rgb(255, 120, 50)).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            if state.chat.is_empty() {
+                "No recent activity".to_string()
+            } else {
+                format!("{} message(s) this session", state.chat.len())
+            },
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(right_lines), cols[1]);
 }
 
 // ---------------------------------------------------------------------------
-// Chat body
+// Chat body — borderless, bullet-style messages
 // ---------------------------------------------------------------------------
 
 fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
-    let block = Block::default().borders(Borders::ALL).title(" chat ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // Horizontal padding: 1 char each side
+    let padded = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height,
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(state.chat.len() * 2);
     for entry in &state.chat {
         match entry {
             ChatLine::User(text) => {
+                lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "You › ",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        "● ",
+                        Style::default().fg(Color::Cyan),
                     ),
-                    Span::raw(text.clone()),
+                    Span::styled(
+                        text.clone(),
+                        Style::default().fg(Color::White),
+                    ),
                 ]));
             }
             ChatLine::Assistant(text) => {
+                lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "ash › ",
+                        "● ",
+                        Style::default().fg(Color::Magenta),
+                    ),
+                    Span::styled(
+                        "ash-code",
                         Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -122,7 +187,11 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
             ChatLine::ToolCall { name, args } => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("⚙  tool_call · {name} "),
+                        "  ▸ ",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{name} "),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(args.clone(), Style::default().fg(Color::DarkGray)),
@@ -130,13 +199,10 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
             }
             ChatLine::ToolResult { name, ok, body } => {
                 let color = if *ok { Color::Green } else { Color::Red };
+                let icon = if *ok { "✓" } else { "✗" };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("  ↳ {name} "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if *ok { "ok" } else { "fail" },
+                        format!("  {icon} {name} "),
                         Style::default().fg(color),
                     ),
                 ]));
@@ -150,67 +216,80 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
             ChatLine::Finish { stop_reason, input_tokens, output_tokens } => {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "  [finish stop_reason={stop_reason} in={input_tokens} out={output_tokens}]"
+                        "  [{stop_reason} in={input_tokens} out={output_tokens}]"
                     ),
                     Style::default().fg(Color::DarkGray),
                 )));
-                lines.push(Line::from(""));
             }
             ChatLine::Error(msg) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ✖ {msg}"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ✖ ",
+                        Style::default().fg(Color::Red),
+                    ),
+                    Span::styled(
+                        msg.clone(),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
             }
             ChatLine::Denial { tool, reason } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ⊘ {tool} denied: {reason}"),
-                    Style::default().fg(Color::Red),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ⊘ ",
+                        Style::default().fg(Color::Red),
+                    ),
+                    Span::styled(
+                        format!("{tool} denied: {reason}"),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
             }
         }
     }
 
     let scroll_total: u16 = lines.len().min(u16::MAX as usize) as u16;
-    let view_h = inner.height;
+    let view_h = padded.height;
     let offset = scroll_total.saturating_sub(view_h).saturating_sub(state.scroll as u16);
 
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((offset, 0));
-    f.render_widget(paragraph, inner);
+    f.render_widget(paragraph, padded);
 }
 
 // ---------------------------------------------------------------------------
-// Input line
+// Input — borderless minimal prompt
 // ---------------------------------------------------------------------------
 
 fn render_input(f: &mut Frame, area: Rect, state: &AppState) {
     let disabled = state.running_turn || matches!(state.mode, Mode::Approval(_));
+
+    // Separator line
+    let sep_area = Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: 1 };
+    let sep_style = if disabled { Color::DarkGray } else { Color::Cyan };
+    let sep = Paragraph::new(Line::from(Span::styled(
+        "─".repeat(sep_area.width as usize),
+        Style::default().fg(sep_style),
+    )));
+    f.render_widget(sep, sep_area);
+
+    // Input line
+    let input_area = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: 1 };
     let prompt_style = if disabled {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default().fg(Color::White)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if disabled { " input (locked) " } else { " input " })
-        .border_style(if disabled {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::Cyan)
-        });
-    let content = format!(
-        "> {}{}",
-        state.input,
-        if disabled { "" } else { "▏" }
-    );
-    let paragraph = Paragraph::new(content).style(prompt_style).block(block);
-    f.render_widget(paragraph, area);
+    let prompt_char = if disabled { "  " } else { "› " };
+    let cursor = if disabled { "" } else { "▏" };
+    let content = format!("{}{}{}", prompt_char, state.input, cursor);
+    let paragraph = Paragraph::new(content).style(prompt_style);
+    f.render_widget(paragraph, input_area);
 }
 
 // ---------------------------------------------------------------------------
-// Status bar
+// Status bar — left: shortcuts, right: model info
 // ---------------------------------------------------------------------------
 
 fn render_status(f: &mut Frame, area: Rect, state: &AppState) {
@@ -219,17 +298,35 @@ fn render_status(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         state.model.clone()
     };
-    let text = format!(
-        " {} · {} · session={} · turns={} · Ctrl-C quit ",
-        state.provider, model_display, state.session_id, state.turns_taken
+
+    let left = if state.running_turn {
+        "Esc cancel · Ctrl-C quit"
+    } else {
+        "? for shortcuts"
+    };
+    let right = format!(
+        "● {} · {} · turns {}",
+        state.provider, model_display, state.turns_taken
     );
-    let paragraph = Paragraph::new(text).style(
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-    f.render_widget(paragraph, area);
+
+    // Pad the right text to right-align it
+    let total_width = area.width as usize;
+    let left_len = left.len();
+    let right_len = right.len();
+    let padding = total_width.saturating_sub(left_len + right_len + 2);
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {left}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(
+            format!("{right} "),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +460,6 @@ mod tests {
             .join("");
         assert!(text.contains("ash-code"));
         assert!(text.contains("anthropic"));
-        assert!(text.contains("claude-opus-4-5"));
         assert!(text.contains("hello"));
         assert!(text.contains("hi there"));
     }
@@ -399,6 +495,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(text.contains("Allow this bash command"));
-        assert!(text.contains("Tell ash-code"));
+        assert!(text.contains("Tell ash-code what to do instead"));
     }
 }
