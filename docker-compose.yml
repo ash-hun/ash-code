@@ -44,3 +44,54 @@ services:
       # The ash-code container does NOT host Ollama. Point this at your own
       # Ollama deployment, e.g. OLLAMA_BASE_URL=https://ollama.internal
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+
+      # --- Session storage (M9.1) ---
+      # postgres (default) | memory
+      - ASH_SESSION_STORE=${ASH_SESSION_STORE:-postgres}
+      # Connection string. Defaults point at the local-db compose service
+      # below. Set to your managed database URL (RDS / Supabase / Cloud SQL)
+      # to use an external Postgres instead — in that case do NOT start
+      # the `ash-postgres` profile.
+      - ASH_POSTGRES_URL=${ASH_POSTGRES_URL:-postgres://ash:ash@ash-postgres:5432/ashcode}
+      - ASH_POSTGRES_POOL_SIZE=${ASH_POSTGRES_POOL_SIZE:-8}
+    depends_on:
+      ash-postgres:
+        condition: service_healthy
+        required: false
+
+  # ----------------------------------------------------------------------
+  # Local PostgreSQL for development (M9.1).
+  #
+  # Activated explicitly via:
+  #   docker compose --profile local-db up -d
+  #
+  # When you point ASH_POSTGRES_URL at an external managed database
+  # (RDS, Supabase, Cloud SQL, …) leave the profile OFF and this service
+  # never starts.
+  # ----------------------------------------------------------------------
+  ash-postgres:
+    image: postgres:16-alpine
+    container_name: ash-postgres
+    profiles: ["local-db"]
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-ash}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ash}
+      - POSTGRES_DB=${POSTGRES_DB:-ashcode}
+    volumes:
+      - ash-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ash} -d ${POSTGRES_DB:-ashcode}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    # Container-internal only by default. Uncomment `ports` if you need
+    # to point host tools (psql, dbeaver, integration tests) at it.
+    expose:
+      - "5432"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+
+volumes:
+  ash-postgres-data:
+    name: ash-postgres-data

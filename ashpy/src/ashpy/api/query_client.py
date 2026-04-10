@@ -133,6 +133,14 @@ class QueryHostClient:
             ],
         }
 
+    async def cancel_turn(self, session_id: str) -> dict:
+        """Cancel an in-flight turn for the given session."""
+        stub = await self._ensure()
+        from ashpy._generated import ash_pb2  # type: ignore
+
+        resp = await stub.CancelTurn(ash_pb2.CancelTurnRequest(session_id=session_id))
+        return {"ok": resp.ok, "message": resp.message}
+
     async def delete_session(self, session_id: str) -> bool:
         stub = await self._ensure()
         from ashpy._generated import ash_pb2  # type: ignore

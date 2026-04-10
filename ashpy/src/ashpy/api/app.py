@@ -19,6 +19,7 @@ from ..providers import get_registry
 from . import routes_commands, routes_skills
 from .query_client import DEFAULT_QUERY_HOST_ENDPOINT, QueryHostClient
 from .schemas import (
+    CancelTurnResponse,
     ChatRequest,
     DeleteSessionResponse,
     HealthResponse,
@@ -157,6 +158,18 @@ def create_app(
         if not ok:
             raise HTTPException(status_code=404, detail="session not found")
         return DeleteSessionResponse(ok=True)
+
+    # --- Cancel -----------------------------------------------------------
+
+    @app.post(
+        "/v1/sessions/{session_id}/cancel",
+        response_model=CancelTurnResponse,
+        tags=["sessions"],
+    )
+    async def cancel_turn(session_id: str) -> CancelTurnResponse:
+        client: QueryHostClient = app.state.query_client
+        result = await client.cancel_turn(session_id)
+        return CancelTurnResponse(**result)
 
     # --- Chat (SSE) -------------------------------------------------------
 

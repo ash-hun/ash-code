@@ -1,6 +1,6 @@
 //! ash-core — session, storage, settings primitives.
-//!
-//! M0 scaffold only.
+
+pub mod storage;
 
 /// Crate identifier used for smoke tests.
 pub const CRATE_NAME: &str = "ash-core";

@@ -20,3 +20,6 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+async-stream.workspace = true

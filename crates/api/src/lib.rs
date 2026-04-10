@@ -9,9 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use ash_core::storage::{
+    self, MemoryStore, SessionRecord, SessionStore, StoredMessage,
+};
 use ash_ipc::{pb, SidecarClient};
 use ash_query::{
-    CancellationToken, QueryBackend, QueryEngine, Session, SidecarBackend, TurnSink,
+    CancellationToken, ChatMessage, QueryBackend, QueryEngine, Session, SidecarBackend, TurnSink,
 };
 use ash_tools::{ToolRegistry, ToolResult};
 use async_trait::async_trait;
@@ -92,24 +95,78 @@ impl TurnSink for ChannelSink {
 
 pub struct QueryHostService {
     engine: Arc<QueryEngine>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    store: Arc<dyn SessionStore>,
     default_provider: String,
     default_model: String,
+    /// Active session → CancellationToken for the in-flight turn.
+    active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
 }
 
 impl QueryHostService {
     pub fn new(
         engine: Arc<QueryEngine>,
+        store: Arc<dyn SessionStore>,
         default_provider: String,
         default_model: String,
     ) -> Self {
         Self {
             engine,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            store,
             default_provider,
             default_model,
+            active_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Convenience constructor for tests / scripts that just want an
+    /// in-memory backing store.
+    pub fn new_in_memory(
+        engine: Arc<QueryEngine>,
+        default_provider: String,
+        default_model: String,
+    ) -> Self {
+        Self::new(
+            engine,
+            Arc::new(MemoryStore::new()),
+            default_provider,
+            default_model,
+        )
+    }
+}
+
+// --- Session ↔ SessionRecord conversion -----------------------------------
+
+fn session_to_record(session: &Session, created_at_ms: i64) -> SessionRecord {
+    SessionRecord {
+        id: session.id.clone(),
+        provider: session.provider.clone(),
+        model: session.model.clone(),
+        created_at_ms,
+        updated_at_ms: SessionRecord::now_ms(),
+        messages: session
+            .messages
+            .iter()
+            .map(|m| StoredMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn record_to_session(record: &SessionRecord) -> Session {
+    let mut s = Session::new(&record.id, &record.provider, &record.model);
+    s.messages = record
+        .messages
+        .iter()
+        .map(|m| ChatMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            tool_call_id: m.tool_call_id.clone(),
+        })
+        .collect();
+    s
 }
 
 #[async_trait]
@@ -139,17 +196,22 @@ impl pb::query_host_server::QueryHost for QueryHostService {
             req.model.clone()
         };
 
-        // Fetch or create the session.
-        let mut session = {
-            let map = self.sessions.read().await;
-            match map.get(&session_id) {
-                Some(s) if !req.reset_session => s.clone(),
-                _ => Session::new(&session_id, &provider, &model),
+        // Fetch or create the session from the store.
+        let existing = self
+            .store
+            .get(&session_id)
+            .await
+            .map_err(|e| Status::internal(format!("session store get: {e}")))?;
+        let (mut session, created_at_ms) = match (existing, req.reset_session) {
+            (Some(rec), false) => {
+                let created = rec.created_at_ms;
+                (record_to_session(&rec), created)
             }
+            _ => (
+                Session::new(&session_id, &provider, &model),
+                SessionRecord::now_ms(),
+            ),
         };
-        if req.reset_session {
-            session = Session::new(&session_id, &provider, &model);
-        }
         session.provider = provider;
         session.model = model;
         session.push_user(req.prompt);
@@ -158,13 +220,23 @@ impl pb::query_host_server::QueryHost for QueryHostService {
         let stream = UnboundedReceiverStream::new(rx);
 
         let engine = self.engine.clone();
-        let sessions = self.sessions.clone();
-        let sid = session_id.clone();
+        let store = self.store.clone();
+        let tokens = self.active_tokens.clone();
 
+        // Create the cancellation token and register it.
+        // If there is already an active turn for this session, cancel it first.
+        let cancel = CancellationToken::new();
+        {
+            let mut map = tokens.write().await;
+            if let Some(prev) = map.insert(session_id.clone(), cancel.clone()) {
+                prev.cancel();
+            }
+        }
+
+        let sid = session_id.clone();
         tokio::spawn(async move {
             let mut sink = ChannelSink::new(tx.clone());
-            let cancel = CancellationToken::new();
-            let outcome = match engine.run_turn(&mut session, &mut sink, cancel).await {
+            let outcome = match engine.run_turn(&mut session, &mut sink, cancel.clone()).await {
                 Ok(o) => o,
                 Err(err) => {
                     let _ = tx.send(Ok(pb::TurnDelta {
@@ -180,14 +252,26 @@ impl pb::query_host_server::QueryHost for QueryHostService {
                             denial_reason: String::new(),
                         })),
                     }));
+                    // Clean up token on error path.
+                    tokens.write().await.remove(&sid);
                     return;
                 }
             };
 
-            // Persist the (now mutated) session back into the store.
+            // Remove the token from the active map (only if it's still ours).
             {
-                let mut map = sessions.write().await;
-                map.insert(sid, session);
+                let mut map = tokens.write().await;
+                if let Some(existing) = map.get(&sid) {
+                    if existing.is_cancelled() == cancel.is_cancelled() {
+                        map.remove(&sid);
+                    }
+                }
+            }
+
+            // Persist the (now mutated) session back into the store.
+            let record = session_to_record(&session, created_at_ms);
+            if let Err(err) = store.put(&record).await {
+                tracing::warn!("session store put failed: {err:#}");
             }
 
             let _ = tx.send(Ok(pb::TurnDelta {
@@ -203,18 +287,42 @@ impl pb::query_host_server::QueryHost for QueryHostService {
         Ok(Response::new(stream))
     }
 
+    async fn cancel_turn(
+        &self,
+        request: Request<pb::CancelTurnRequest>,
+    ) -> Result<Response<pb::CancelTurnResponse>, Status> {
+        let session_id = request.into_inner().session_id;
+        let map = self.active_tokens.read().await;
+        if let Some(token) = map.get(&session_id) {
+            token.cancel();
+            Ok(Response::new(pb::CancelTurnResponse {
+                ok: true,
+                message: "cancelled".to_string(),
+            }))
+        } else {
+            Ok(Response::new(pb::CancelTurnResponse {
+                ok: false,
+                message: "no active turn".to_string(),
+            }))
+        }
+    }
+
     async fn list_sessions(
         &self,
         _request: Request<pb::ListSessionsRequest>,
     ) -> Result<Response<pb::ListSessionsResponse>, Status> {
-        let map = self.sessions.read().await;
-        let sessions = map
-            .values()
+        let summaries = self
+            .store
+            .list()
+            .await
+            .map_err(|e| Status::internal(format!("list: {e}")))?;
+        let sessions = summaries
+            .into_iter()
             .map(|s| pb::SessionSummary {
-                id: s.id.clone(),
-                provider: s.provider.clone(),
-                model: s.model.clone(),
-                message_count: s.messages.len() as i32,
+                id: s.id,
+                provider: s.provider,
+                model: s.model,
+                message_count: s.message_count,
             })
             .collect();
         Ok(Response::new(pb::ListSessionsResponse { sessions }))
@@ -225,17 +333,19 @@ impl pb::query_host_server::QueryHost for QueryHostService {
         request: Request<pb::GetSessionRequest>,
     ) -> Result<Response<pb::GetSessionResponse>, Status> {
         let id = request.into_inner().id;
-        let map = self.sessions.read().await;
-        let session = map
+        let record = self
+            .store
             .get(&id)
+            .await
+            .map_err(|e| Status::internal(format!("get: {e}")))?
             .ok_or_else(|| Status::not_found(format!("session not found: {id}")))?;
         let summary = pb::SessionSummary {
-            id: session.id.clone(),
-            provider: session.provider.clone(),
-            model: session.model.clone(),
-            message_count: session.messages.len() as i32,
+            id: record.id.clone(),
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            message_count: record.messages.len() as i32,
         };
-        let messages = session
+        let messages = record
             .messages
             .iter()
             .map(|m| pb::ChatMessage {
@@ -255,8 +365,11 @@ impl pb::query_host_server::QueryHost for QueryHostService {
         request: Request<pb::DeleteSessionRequest>,
     ) -> Result<Response<pb::DeleteSessionResponse>, Status> {
         let id = request.into_inner().id;
-        let mut map = self.sessions.write().await;
-        let existed = map.remove(&id).is_some();
+        let existed = self
+            .store
+            .delete(&id)
+            .await
+            .map_err(|e| Status::internal(format!("delete: {e}")))?;
         Ok(Response::new(pb::DeleteSessionResponse { ok: existed }))
     }
 }
@@ -278,7 +391,15 @@ pub async fn serve(
     let tools = Arc::new(ToolRegistry::with_builtins());
     let engine = Arc::new(QueryEngine::new(backend, tools));
 
-    let service = QueryHostService::new(engine, default_provider, default_model);
+    // Build the session store from `ASH_SESSION_STORE` (default: postgres).
+    // M9.1: postgres backend is dev-default via the compose `ash-postgres`
+    // service, but the URL can point at any external database.
+    let store = storage::build_default()
+        .await
+        .map_err(|e| anyhow::anyhow!("session store init failed: {e:#}"))?;
+    println!("[ash] session store ready");
+
+    let service = QueryHostService::new(engine, store, default_provider, default_model);
     let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
     tracing::info!("ash QueryHost gRPC listening on {addr}");
     println!("[ash] QueryHost gRPC listening on {addr}");
@@ -393,7 +514,7 @@ mod tests {
             backend,
             Arc::new(ToolRegistry::with_builtins()),
         ));
-        QueryHostService::new(engine, "mock".to_string(), "mock-1".to_string())
+        QueryHostService::new_in_memory(engine, "mock".to_string(), "mock-1".to_string())
     }
 
     #[tokio::test]
@@ -471,6 +592,167 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.role == "user" && m.content == "hello there"));
+    }
+
+    // SlowBackend — introduces a delay so we can cancel mid-turn.
+    struct SlowBackend {
+        delay: Duration,
+    }
+
+    impl SlowBackend {
+        fn new(delay: Duration) -> Self {
+            Self { delay }
+        }
+    }
+
+    #[async_trait]
+    impl QueryBackend for SlowBackend {
+        async fn chat_stream(
+            &self,
+            _req: pb::ChatRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<pb::ChatDelta, Status>>> {
+            let delay = self.delay;
+            let stream = async_stream::stream! {
+                tokio::time::sleep(delay).await;
+                yield Ok(pb::ChatDelta {
+                    kind: Some(pb::chat_delta::Kind::Finish(pb::TurnFinish {
+                        stop_reason: "end_turn".to_string(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    })),
+                });
+            };
+            Ok(Box::pin(stream))
+        }
+
+        async fn on_turn_start(&self, _ctx: pb::TurnContext) -> Result<pb::HookDecision> {
+            Ok(pb::HookDecision {
+                kind: pb::hook_decision::Kind::Allow as i32,
+                reason: String::new(),
+                rewritten_payload: Vec::new(),
+            })
+        }
+
+        async fn on_tool_call(&self, _event: pb::ToolCallEvent) -> Result<pb::HookDecision> {
+            Ok(pb::HookDecision {
+                kind: pb::hook_decision::Kind::Allow as i32,
+                reason: String::new(),
+                rewritten_payload: Vec::new(),
+            })
+        }
+
+        async fn on_turn_end(&self, _result: pb::TurnResult) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn build_slow_service(delay: Duration) -> QueryHostService {
+        let backend: Arc<dyn QueryBackend> = Arc::new(SlowBackend::new(delay));
+        let engine = Arc::new(QueryEngine::new(
+            backend,
+            Arc::new(ToolRegistry::with_builtins()),
+        ));
+        QueryHostService::new_in_memory(engine, "mock".to_string(), "mock-1".to_string())
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_cancels_active_turn() {
+        let svc = build_slow_service(Duration::from_secs(10));
+
+        // Start a long-running turn.
+        let _resp = svc
+            .run_turn(Request::new(pb::RunTurnRequest {
+                session_id: "cancel-me".to_string(),
+                prompt: "slow".to_string(),
+                provider: String::new(),
+                model: String::new(),
+                reset_session: false,
+            }))
+            .await
+            .unwrap();
+
+        // Give the spawn a moment to register the token.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancel it.
+        let cancel_resp = svc
+            .cancel_turn(Request::new(pb::CancelTurnRequest {
+                session_id: "cancel-me".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cancel_resp.ok);
+        assert_eq!(cancel_resp.message, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_no_active_turn() {
+        let svc = build_slow_service(Duration::from_secs(1));
+
+        let resp = svc
+            .cancel_turn(Request::new(pb::CancelTurnRequest {
+                session_id: "nonexistent".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.ok);
+        assert_eq!(resp.message, "no active turn");
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_turn_cancels_previous() {
+        let svc = build_slow_service(Duration::from_secs(10));
+
+        // Start first turn.
+        let resp1 = svc
+            .run_turn(Request::new(pb::RunTurnRequest {
+                session_id: "dup".to_string(),
+                prompt: "first".to_string(),
+                provider: String::new(),
+                model: String::new(),
+                reset_session: false,
+            }))
+            .await
+            .unwrap();
+        let mut stream1 = resp1.into_inner();
+
+        // Give the first spawn a moment.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Start second turn on the same session — should auto-cancel the first.
+        let _resp2 = svc
+            .run_turn(Request::new(pb::RunTurnRequest {
+                session_id: "dup".to_string(),
+                prompt: "second".to_string(),
+                provider: String::new(),
+                model: String::new(),
+                reset_session: false,
+            }))
+            .await
+            .unwrap();
+
+        // The first stream should receive a cancelled outcome.
+        let mut saw_cancelled = false;
+        while let Some(item) = stream1.next().await {
+            if let Ok(delta) = item {
+                match delta.kind {
+                    Some(pb::turn_delta::Kind::Outcome(o)) => {
+                        if o.stop_reason == "cancelled" {
+                            saw_cancelled = true;
+                        }
+                    }
+                    Some(pb::turn_delta::Kind::Error(e)) => {
+                        if e.contains("cancel") {
+                            saw_cancelled = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_cancelled, "first turn should have been cancelled");
     }
 
     #[tokio::test]

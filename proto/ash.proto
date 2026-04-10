@@ -254,6 +254,7 @@ message InvokeToolResponse {
 // outside the container.
 service QueryHost {
   rpc RunTurn(RunTurnRequest) returns (stream TurnDelta);
+  rpc CancelTurn(CancelTurnRequest) returns (CancelTurnResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
@@ -309,6 +310,12 @@ message GetSessionRequest { string id = 1; }
 message GetSessionResponse {
   SessionSummary summary = 1;
   repeated ChatMessage messages = 2;
+}
+
+message CancelTurnRequest { string session_id = 1; }
+message CancelTurnResponse {
+  bool ok = 1;
+  string message = 2;   // e.g. "cancelled" or "no active turn"
 }
 
 message DeleteSessionRequest { string id = 1; }

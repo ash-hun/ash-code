@@ -68,5 +68,10 @@ class ChatRequest(BaseModel):
     )
 
 
+class CancelTurnResponse(BaseModel):
+    ok: bool
+    message: str
+
+
 class DeleteSessionResponse(BaseModel):
     ok: bool
