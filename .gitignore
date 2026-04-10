@@ -1,3 +1,24 @@
 .claude
-
 reference/
+.env
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+**/.venv/
+*.egg-info/
+.pytest_cache/
+
+# Project runtime
+.ash/
+workspace/
+!skills/.gitkeep
+!commands/.gitkeep
+!providers/.gitkeep

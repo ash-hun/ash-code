@@ -1,0 +1,21 @@
+[package]
+name = "ash-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ash-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+walkdir.workspace = true
+globset.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }

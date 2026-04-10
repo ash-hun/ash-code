@@ -1,0 +1,27 @@
+[package]
+name = "ash-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ash-core.workspace = true
+ash-tools.workspace = true
+ash-ipc.workspace = true
+ash-bus.workspace = true
+tokio = { workspace = true }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tonic.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }
+async-stream.workspace = true

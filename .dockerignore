@@ -1,0 +1,10 @@
+.git
+.github
+reference
+target
+**/__pycache__
+**/*.pyc
+.venv
+**/.venv
+.ash
+workspace

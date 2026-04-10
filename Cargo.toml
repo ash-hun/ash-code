@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/tools",
+    "crates/query",
+    "crates/tui",
+    "crates/api",
+    "crates/ipc",
+    "crates/bus",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["ash-code contributors"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "=4.5.20", features = ["derive", "env"] }
+
+# gRPC
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-stream = "0.3"
+async-trait = "0.1"
+futures = "0.3"
+
+# Tool runtime
+schemars = { version = "0.8", features = ["preserve_order"] }
+walkdir = "2"
+globset = "0.4"
+tempfile = "3"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# TUI (M7)
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
+
+# Persistence (M9.1)
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+chrono = { version = "0.4", features = ["serde"] }
+
+ash-core = { path = "crates/core" }
+ash-tools = { path = "crates/tools" }
+ash-query = { path = "crates/query" }
+ash-tui = { path = "crates/tui" }
+ash-api = { path = "crates/api" }
+ash-ipc = { path = "crates/ipc" }
+ash-bus = { path = "crates/bus" }

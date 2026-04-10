@@ -1,0 +1,20 @@
+[package]
+name = "ash-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ash"
+path = "src/main.rs"
+
+[dependencies]
+ash-core.workspace = true
+ash-api.workspace = true
+ash-tui.workspace = true
+ash-ipc.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,16 @@
+name = "summarize"
+description = "Read a file and emit a structured summary"
+allowed_tools = ["file_read"]
+prompt = """
+Summarize the file at `{{ args.path | default("(unspecified)") }}`.
+
+Produce:
+- **Purpose**: one sentence on what the file is for.
+- **Key symbols**: top-level functions, classes, constants with a one-line
+  description each.
+- **External dependencies**: third-party imports.
+- **Notable risks**: brittle, unsafe, or TODO-ish parts.
+
+Keep the whole summary under 20 lines. Cite locations as
+`{{ args.path }}:LINE`.
+"""

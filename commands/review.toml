@@ -1,0 +1,16 @@
+name = "review"
+description = "Review the staged git diff with a configurable focus"
+allowed_tools = ["bash", "file_read", "grep"]
+model = "claude-opus-4-5"
+prompt = """
+You are reviewing the current staged git diff.
+
+Steps:
+1. Run `git diff --staged` via the bash tool.
+2. For each touched file, read surrounding context with file_read if needed.
+3. Focus on: {{ args.focus | default("overall quality and obvious bugs") }}
+4. Report findings as `path/to/file.ext:LINE` references, one bullet per
+   finding, concrete and actionable.
+
+If the diff is empty, say so and stop.
+"""
