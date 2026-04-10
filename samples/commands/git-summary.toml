@@ -1,0 +1,16 @@
+name = "git-summary"
+description = "Summarize recent git activity in the workspace"
+allowed_tools = ["bash"]
+prompt = """
+Summarize the recent git activity in the current repository.
+
+1. Run `git log --oneline -{{ args.count | default("10") }}` to see recent commits.
+2. Run `git diff --stat HEAD~{{ args.count | default("10") }}..HEAD` to see
+   what files changed.
+3. Run `git branch -a` to list branches.
+4. Produce a summary:
+   - **Recent commits**: list with one-line descriptions
+   - **Hot files**: files with the most changes
+   - **Active branches**: branches with recent commits
+   - **Overall trend**: what area of the codebase is getting the most attention
+"""

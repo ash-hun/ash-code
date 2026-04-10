@@ -1,0 +1,18 @@
+name = "healthcheck"
+description = "Check the health of a running service and report issues"
+allowed_tools = ["bash"]
+prompt = """
+Check the health of the service at {{ args.url | default("http://localhost:8080") }}.
+
+Steps:
+1. Run `curl -s {{ args.url | default("http://localhost:8080") }}/v1/health` via
+   the bash tool to get the health response.
+2. If the service is unreachable, check if the container is running with
+   `docker ps | grep ash-code`.
+3. If the container is running but the service is down, check logs with
+   `docker logs ash-code --tail 20`.
+4. Report the status clearly:
+   - Service status (up / down / degraded)
+   - Features available (from the health response)
+   - Any errors found in logs
+"""
