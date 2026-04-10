@@ -5,6 +5,7 @@ use std::io;
 use std::sync::Arc;
 
 use anyhow::Result;
+use ash_ipc::SidecarClient;
 use ash_query::{CancellationToken, QueryEngine, Session, TurnSink};
 use ash_tools::ToolResult as RsToolResult;
 use crossterm::event::{
@@ -96,6 +97,8 @@ pub async fn run_event_loop(
     initial_session: Session,
     config: TuiConfig,
     mut approval_rx: mpsc::UnboundedReceiver<ApprovalEnvelope>,
+    palette_entries: Vec<crate::app::PaletteEntry>,
+    sidecar: SidecarClient,
 ) -> Result<()> {
     // --- terminal setup ---
     enable_raw_mode()?;
@@ -112,6 +115,7 @@ pub async fn run_event_loop(
         config.model.clone(),
         initial_session.id.clone(),
     );
+    state.palette_entries = palette_entries;
     let mut session = initial_session;
 
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
@@ -134,6 +138,7 @@ pub async fn run_event_loop(
                         key.modifiers,
                         &engine,
                         &turn_tx,
+                        &sidecar,
                     );
                 }
             }
@@ -186,6 +191,7 @@ fn handle_key(
     modifiers: KeyModifiers,
     engine: &Arc<QueryEngine>,
     turn_tx: &mpsc::UnboundedSender<TurnEvent>,
+    sidecar: &SidecarClient,
 ) {
     // Global: Ctrl-C always quits.
     if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
@@ -231,11 +237,52 @@ fn handle_key(
         return;
     }
 
+    // Slash palette mode.
+    if matches!(state.mode, Mode::SlashPalette(_)) {
+        match code {
+            KeyCode::Enter => {
+                state.palette_confirm();
+            }
+            KeyCode::Esc => {
+                state.palette_dismiss();
+                state.input.clear();
+            }
+            KeyCode::Up => state.palette_prev(),
+            KeyCode::Down | KeyCode::Tab => state.palette_next(),
+            KeyCode::Backspace => state.backspace(),
+            KeyCode::Char(c) => state.push_char(c),
+            _ => {}
+        }
+        return;
+    }
+
     // Normal mode.
     match code {
         KeyCode::Enter => {
             if let Some(prompt) = state.take_prompt() {
-                spawn_turn(state, session, prompt, engine.clone(), turn_tx.clone());
+                if prompt.starts_with('/') {
+                    // Parse: /<name> <args...>
+                    let without_slash = &prompt[1..];
+                    let (name, rest) = match without_slash.split_once(' ') {
+                        Some((n, r)) => (n.to_string(), r.trim().to_string()),
+                        None => (without_slash.to_string(), String::new()),
+                    };
+
+                    // Find the entry in palette to determine kind
+                    let entry = state.palette_entries.iter().find(|e| e.name == name);
+                    if let Some(entry) = entry {
+                        let kind = entry.kind.clone();
+                        spawn_slash_turn(
+                            state, session, name, rest, kind,
+                            engine.clone(), turn_tx.clone(), sidecar.clone(),
+                        );
+                    } else {
+                        // Unknown slash command — send as plain prompt
+                        spawn_turn(state, session, prompt, engine.clone(), turn_tx.clone());
+                    }
+                } else {
+                    spawn_turn(state, session, prompt, engine.clone(), turn_tx.clone());
+                }
             }
         }
         KeyCode::Backspace => state.backspace(),
@@ -273,6 +320,89 @@ fn spawn_turn(
 
     let mut working_session = session.clone();
     tokio::spawn(async move {
+        let mut sink = ChannelSink::new(turn_tx.clone());
+        let outcome = engine.run_turn(&mut working_session, &mut sink, cancel).await;
+        let msg = match outcome {
+            Ok(outcome) => Ok((
+                working_session,
+                TurnOutcomeSummary {
+                    stop_reason: outcome.stop_reason,
+                    turns_taken: outcome.turns_taken,
+                    denied: outcome.denied,
+                    denial_reason: outcome.denial_reason,
+                },
+            )),
+            Err(err) => Err(format!("{err:#}")),
+        };
+        let _ = turn_tx.send(TurnEvent::Done(msg));
+    });
+}
+
+/// Resolve a slash command/skill via the sidecar, then run the rendered
+/// prompt as a normal turn.
+fn spawn_slash_turn(
+    state: &mut AppState,
+    session: &mut Session,
+    name: String,
+    args_str: String,
+    kind: crate::app::PaletteKind,
+    engine: Arc<QueryEngine>,
+    turn_tx: mpsc::UnboundedSender<TurnEvent>,
+    sidecar: SidecarClient,
+) {
+    let display = if args_str.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{name} {args_str}")
+    };
+    state.push_user(display);
+    state.running_turn = true;
+    let cancel = CancellationToken::new();
+    state.current_cancel = Some(cancel.clone());
+
+    // Build simple args map: the rest of the input goes as "input" key
+    let mut args = std::collections::HashMap::new();
+    if !args_str.is_empty() {
+        // Put the raw text as multiple possible arg keys for flexibility
+        args.insert("input".to_string(), args_str.clone());
+        args.insert("path".to_string(), args_str.clone());
+        args.insert("focus".to_string(), args_str.clone());
+        args.insert("target".to_string(), args_str.clone());
+        args.insert("error".to_string(), args_str.clone());
+    }
+
+    let mut working_session = session.clone();
+    tokio::spawn(async move {
+        // Resolve the slash command to a rendered prompt via sidecar
+        let rendered = match kind {
+            crate::app::PaletteKind::Skill => {
+                match sidecar.invoke_skill(&name, args).await {
+                    Ok(resp) => resp.rendered_prompt,
+                    Err(e) => {
+                        let _ = turn_tx.send(TurnEvent::Error(
+                            format!("skill '/{name}' resolve failed: {e:#}"),
+                        ));
+                        let _ = turn_tx.send(TurnEvent::Done(Err(format!("{e:#}"))));
+                        return;
+                    }
+                }
+            }
+            crate::app::PaletteKind::Command => {
+                match sidecar.render_command(&name, args).await {
+                    Ok(resp) => resp.rendered_prompt,
+                    Err(e) => {
+                        let _ = turn_tx.send(TurnEvent::Error(
+                            format!("command '/{name}' resolve failed: {e:#}"),
+                        ));
+                        let _ = turn_tx.send(TurnEvent::Done(Err(format!("{e:#}"))));
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Push the rendered prompt as a user message and run the turn
+        working_session.push_user(&rendered);
         let mut sink = ChannelSink::new(turn_tx.clone());
         let outcome = engine.run_turn(&mut working_session, &mut sink, cancel).await;
         let msg = match outcome {

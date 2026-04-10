@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{AppState, ChatLine, Mode};
+use crate::app::{AppState, ChatLine, Mode, PaletteKind};
 
 /// Top-level render function called once per frame.
 pub fn render(f: &mut Frame, state: &AppState) {
@@ -26,6 +26,11 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_chat(f, chunks[1], state);
     render_input(f, chunks[2], state);
     render_status(f, chunks[3], state);
+
+    // Slash palette (rendered above input area).
+    if matches!(state.mode, Mode::SlashPalette(_)) {
+        render_slash_palette(f, chunks[1], state);
+    }
 
     // Modal overlay for approvals.
     if matches!(state.mode, Mode::Approval(_)) {
@@ -248,9 +253,22 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    let scroll_total: u16 = lines.len().min(u16::MAX as usize) as u16;
+    // Estimate wrapped line count for accurate scroll-to-bottom.
+    let wrap_width = padded.width.max(1) as usize;
+    let mut visual_lines: u16 = 0;
+    for line in &lines {
+        let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        if line_width == 0 {
+            visual_lines += 1;
+        } else {
+            visual_lines += ((line_width + wrap_width - 1) / wrap_width) as u16;
+        }
+    }
+
     let view_h = padded.height;
-    let offset = scroll_total.saturating_sub(view_h).saturating_sub(state.scroll as u16);
+    let offset = visual_lines
+        .saturating_sub(view_h)
+        .saturating_sub(state.scroll as u16);
 
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -404,6 +422,92 @@ fn render_approval_modal(f: &mut Frame, area: Rect, state: &AppState) {
         let hint = Paragraph::new("↑↓ select · 1/2/3 jump · Enter confirm · Esc cancel")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(hint, chunks[2]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slash palette — bottom-anchored overlay listing commands/skills
+// ---------------------------------------------------------------------------
+
+fn render_slash_palette(f: &mut Frame, chat_area: Rect, state: &AppState) {
+    let palette = match &state.mode {
+        Mode::SlashPalette(p) => p,
+        _ => return,
+    };
+
+    let max_visible: usize = 8;
+    let visible_count = palette.filtered.len().min(max_visible);
+    if visible_count == 0 {
+        return;
+    }
+
+    let height = visible_count as u16 + 2; // +2 for border
+    // Position at the bottom of the chat area
+    let palette_area = Rect {
+        x: chat_area.x + 1,
+        y: chat_area.y + chat_area.height.saturating_sub(height),
+        width: chat_area.width.saturating_sub(2),
+        height,
+    };
+
+    f.render_widget(Clear, palette_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (vi, &entry_idx) in palette.filtered.iter().take(max_visible).enumerate() {
+        let entry = &palette.entries[entry_idx];
+        let is_selected = vi == palette.selected;
+
+        let kind_label = match entry.kind {
+            PaletteKind::Command => "cmd",
+            PaletteKind::Skill => "skill",
+        };
+
+        let name_style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        };
+        let desc_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let kind_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+
+        let marker = if is_selected { "▸ " } else { "  " };
+
+        lines.push(Line::from(vec![
+            Span::styled(marker, name_style),
+            Span::styled(format!("/{:<18}", entry.name), name_style),
+            Span::styled(format!("[{kind_label}]  "), kind_style),
+            Span::styled(
+                truncate_str(&entry.description, palette_area.width.saturating_sub(30) as usize),
+                desc_style,
+            ),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, palette_area);
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len > 3 {
+        format!("{}...", &s[..max_len - 3])
+    } else {
+        s[..max_len].to_string()
     }
 }
 
