@@ -255,6 +255,7 @@ message InvokeToolResponse {
 service QueryHost {
   rpc RunTurn(RunTurnRequest) returns (stream TurnDelta);
   rpc CancelTurn(CancelTurnRequest) returns (CancelTurnResponse);
+  rpc WatchSession(WatchSessionRequest) returns (stream WatchEvent);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
@@ -320,6 +321,15 @@ message CancelTurnResponse {
 
 message DeleteSessionRequest { string id = 1; }
 message DeleteSessionResponse { bool ok = 1; }
+
+message WatchSessionRequest { string session_id = 1; }
+message WatchEvent {
+  string event_type = 1;     // "user_message" | "assistant_text" | "tool_call"
+                             // | "tool_result" | "turn_finish" | "turn_error"
+                             // | "cancelled" | "outcome"
+  string session_id = 2;
+  bytes  payload = 3;        // JSON-encoded event-specific data (UTF-8)
+}
 
 // ========================================================================
 // Shared

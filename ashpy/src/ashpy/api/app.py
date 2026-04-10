@@ -171,6 +171,27 @@ def create_app(
         result = await client.cancel_turn(session_id)
         return CancelTurnResponse(**result)
 
+    # --- Watch (SSE) ------------------------------------------------------
+
+    @app.get("/v1/sessions/{session_id}/watch", tags=["sessions"])
+    async def watch_session(session_id: str):
+        client: QueryHostClient = app.state.query_client
+
+        async def event_stream():
+            try:
+                async for event in client.watch_session(session_id):
+                    yield {
+                        "event": event["event_type"],
+                        "data": json.dumps(event),
+                    }
+            except Exception as exc:  # noqa: BLE001
+                yield {
+                    "event": "error",
+                    "data": json.dumps({"event_type": "error", "payload": {"message": str(exc)}}),
+                }
+
+        return EventSourceResponse(event_stream())
+
     # --- Chat (SSE) -------------------------------------------------------
 
     @app.post("/v1/chat", tags=["chat"])

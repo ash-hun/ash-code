@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import AsyncIterator
 
@@ -93,6 +94,28 @@ class QueryHostClient:
                     }
         except grpc.RpcError as exc:
             yield {"type": "error", "message": f"grpc error: {exc.code().name}: {exc.details()}"}
+
+    async def watch_session(self, session_id: str) -> AsyncIterator[dict]:
+        """Open a ``WatchSession`` stream and yield events as plain dicts."""
+        stub = await self._ensure()
+        from ashpy._generated import ash_pb2  # type: ignore
+
+        req = ash_pb2.WatchSessionRequest(session_id=session_id)
+        try:
+            async for event in stub.WatchSession(req):
+                yield {
+                    "event_type": event.event_type,
+                    "session_id": event.session_id,
+                    "payload": json.loads(event.payload.decode("utf-8"))
+                    if event.payload
+                    else {},
+                }
+        except grpc.RpcError as exc:
+            yield {
+                "event_type": "error",
+                "session_id": session_id,
+                "payload": {"message": f"grpc error: {exc.code().name}: {exc.details()}"},
+            }
 
     async def list_sessions(self) -> list[dict]:
         stub = await self._ensure()

@@ -12,6 +12,7 @@ use anyhow::Result;
 use ash_core::storage::{
     self, MemoryStore, SessionRecord, SessionStore, StoredMessage,
 };
+use ash_bus::BusEvent;
 use ash_ipc::{pb, SidecarClient};
 use ash_query::{
     CancellationToken, ChatMessage, QueryBackend, QueryEngine, Session, SidecarBackend, TurnSink,
@@ -86,6 +87,60 @@ impl TurnSink for ChannelSink {
         self.send(pb::TurnDelta {
             kind: Some(pb::turn_delta::Kind::Error(message.to_string())),
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BusEvent → WatchEvent conversion
+// ---------------------------------------------------------------------------
+
+fn bus_event_to_watch(session_id: &str, event: &BusEvent) -> pb::WatchEvent {
+    let (event_type, payload) = match event {
+        BusEvent::UserMessage { text } => (
+            "user_message",
+            serde_json::json!({ "text": text }),
+        ),
+        BusEvent::AssistantText { text } => (
+            "assistant_text",
+            serde_json::json!({ "text": text }),
+        ),
+        BusEvent::ToolCall { id, name, args } => (
+            "tool_call",
+            serde_json::json!({ "id": id, "name": name, "arguments": args }),
+        ),
+        BusEvent::ToolResult { name, ok, body } => (
+            "tool_result",
+            serde_json::json!({ "name": name, "ok": ok, "body": body }),
+        ),
+        BusEvent::TurnFinish { stop_reason, in_tok, out_tok } => (
+            "turn_finish",
+            serde_json::json!({
+                "stop_reason": stop_reason,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+            }),
+        ),
+        BusEvent::TurnError { message } => (
+            "turn_error",
+            serde_json::json!({ "message": message }),
+        ),
+        BusEvent::Cancelled { reason } => (
+            "cancelled",
+            serde_json::json!({ "reason": reason }),
+        ),
+        BusEvent::Outcome { stop_reason, turns_taken, denied } => (
+            "outcome",
+            serde_json::json!({
+                "stop_reason": stop_reason,
+                "turns_taken": turns_taken,
+                "denied": denied,
+            }),
+        ),
+    };
+    pb::WatchEvent {
+        event_type: event_type.to_string(),
+        session_id: session_id.to_string(),
+        payload: serde_json::to_vec(&payload).unwrap_or_default(),
     }
 }
 
@@ -172,6 +227,7 @@ fn record_to_session(record: &SessionRecord) -> Session {
 #[async_trait]
 impl pb::query_host_server::QueryHost for QueryHostService {
     type RunTurnStream = UnboundedReceiverStream<Result<pb::TurnDelta, Status>>;
+    type WatchSessionStream = UnboundedReceiverStream<Result<pb::WatchEvent, Status>>;
 
     async fn run_turn(
         &self,
@@ -305,6 +361,38 @@ impl pb::query_host_server::QueryHost for QueryHostService {
                 message: "no active turn".to_string(),
             }))
         }
+    }
+
+    async fn watch_session(
+        &self,
+        request: Request<pb::WatchSessionRequest>,
+    ) -> Result<Response<Self::WatchSessionStream>, Status> {
+        let session_id = request.into_inner().session_id;
+        let mut rx = self.engine.bus().subscribe(&session_id);
+        let (tx, out_rx) = mpsc::unbounded_channel();
+        let sid = session_id.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let watch = bus_event_to_watch(&sid, &event);
+                        if tx.send(Ok(watch)).is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("watch subscriber lagged by {n} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break; // session channel closed
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(UnboundedReceiverStream::new(out_rx)))
     }
 
     async fn list_sessions(
@@ -753,6 +841,118 @@ mod tests {
             }
         }
         assert!(saw_cancelled, "first turn should have been cancelled");
+    }
+
+    #[tokio::test]
+    async fn watch_session_receives_bus_events() {
+        let backend = Arc::new(MockBackend::default());
+        backend.push_turn(vec![text_delta("hi"), finish_delta()]);
+        let svc = build_service(backend);
+
+        // Subscribe BEFORE the turn starts (broadcast does not replay).
+        let watch_resp = svc
+            .watch_session(Request::new(pb::WatchSessionRequest {
+                session_id: "w1".to_string(),
+            }))
+            .await
+            .unwrap();
+        let mut watch_stream = watch_resp.into_inner();
+
+        // Run a turn that will publish events to the bus.
+        let turn_resp = svc
+            .run_turn(Request::new(pb::RunTurnRequest {
+                session_id: "w1".to_string(),
+                prompt: "hello".to_string(),
+                provider: String::new(),
+                model: String::new(),
+                reset_session: false,
+            }))
+            .await
+            .unwrap();
+        // Drain the turn stream to completion.
+        let mut turn_stream = turn_resp.into_inner();
+        while turn_stream.next().await.is_some() {}
+
+        // Collect watch events (with a timeout to avoid hanging).
+        let mut event_types = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), watch_stream.next()).await {
+                Ok(Some(Ok(event))) => {
+                    event_types.push(event.event_type.clone());
+                    if event.event_type == "outcome" {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            event_types.contains(&"assistant_text".to_string()),
+            "should contain assistant_text, got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"outcome".to_string()),
+            "should contain outcome, got: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_session_two_subscribers() {
+        let backend = Arc::new(MockBackend::default());
+        backend.push_turn(vec![text_delta("x"), finish_delta()]);
+        let svc = build_service(backend);
+
+        // Two subscribers on the same session.
+        let resp_a = svc
+            .watch_session(Request::new(pb::WatchSessionRequest {
+                session_id: "w2".to_string(),
+            }))
+            .await
+            .unwrap();
+        let mut stream_a = resp_a.into_inner();
+
+        let resp_b = svc
+            .watch_session(Request::new(pb::WatchSessionRequest {
+                session_id: "w2".to_string(),
+            }))
+            .await
+            .unwrap();
+        let mut stream_b = resp_b.into_inner();
+
+        // Run a turn.
+        let turn_resp = svc
+            .run_turn(Request::new(pb::RunTurnRequest {
+                session_id: "w2".to_string(),
+                prompt: "hi".to_string(),
+                provider: String::new(),
+                model: String::new(),
+                reset_session: false,
+            }))
+            .await
+            .unwrap();
+        let mut turn_stream = turn_resp.into_inner();
+        while turn_stream.next().await.is_some() {}
+
+        // Both subscribers should receive the outcome event.
+        let mut a_got_outcome = false;
+        let mut b_got_outcome = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), stream_a.next()).await {
+                Ok(Some(Ok(e))) if e.event_type == "outcome" => { a_got_outcome = true; break; }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), stream_b.next()).await {
+                Ok(Some(Ok(e))) if e.event_type == "outcome" => { b_got_outcome = true; break; }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(a_got_outcome, "subscriber A should get outcome");
+        assert!(b_got_outcome, "subscriber B should get outcome");
     }
 
     #[tokio::test]
