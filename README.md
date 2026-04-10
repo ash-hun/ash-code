@@ -1,4 +1,6 @@
-# ash-code
+# AshCode
+
+<img src="./assets/screenshot.png" />
 
 Docker 컨테이너 기반 코딩 하네스. LLM과 대화하면서 파일 읽기/쓰기, bash 실행 등을 자동으로 수행합니다.
 
